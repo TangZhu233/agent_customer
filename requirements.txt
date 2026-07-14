@@ -1,0 +1,27 @@
+# ============================================================
+# 智能客服 Agent 项目 — pip 依赖清单
+# 安装方式（在 VSCode 终端中执行）：
+#   conda activate agent_customer
+#   pip install -r requirements.txt
+# ============================================================
+
+# LangChain 核心（Agent 框架）
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+
+# DeepSeek 模型集成（LangChain 官方包）
+langchain-deepseek>=0.1.0
+
+# OpenAI SDK（DeepSeek API 兼容 OpenAI 接口格式）
+openai>=1.0.0
+
+# Web 框架（提供 API 接口）
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# 环境变量管理（.env 文件读取）
+python-dotenv>=1.0.0
+
+# 数据校验（请求/响应模型）
+pydantic>=2.0.0
