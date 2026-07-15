@@ -1,5 +1,6 @@
 ---
-description: 完成核心功能或Bug修复后，更新项目记忆文档
+name: project-update
+description: 完成核心功能或Bug修复后，更新项目记忆文档。当你需要记录开发进度、更新项目摘要时调用。
 ---
 
 按以下流程更新记忆文档：

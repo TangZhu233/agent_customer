@@ -1,6 +1,6 @@
 # 项目概览
 
-> 最后更新: 2026-07-14 | 版本: v0.1.0 | 状态: 🟢 开发中
+> 最后更新: 2026-07-15 | 版本: v0.1.0 | 状态: 🟢 开发中
 
 ---
 
@@ -71,8 +71,15 @@ agent_customer/
 │   ├── .gitkeep
 │   └── customer.db             # SQLite 数据库 (不入 Git)
 ├── .claude/
+│   ├── agents/
+│   │   └── record-keeper.md      # 记录备份工程师 Agent
 │   └── skills/
-│       └── git-push.md         # Git 一键推送 Skill
+│       ├── git-push/
+│       │   └── SKILL.md          # Git 一键推送 Skill
+│       ├── project-init/
+│       │   └── SKILL.md          # 上下文恢复 Skill
+│       └── project-update/
+│           └── SKILL.md          # 记忆文档更新 Skill
 ├── .env                        # 真实密钥 (不入 Git)
 ├── .env.example                # 配置模板
 ├── .gitignore
@@ -122,3 +129,9 @@ uvicorn app.main:app --reload
 | `git-push` | 一键 add → commit → push | `/git-push` |
 | `project-init` | 新会话启动，读取记忆恢复上下文 | `/project-init` |
 | `project-update` | 完成修改后更新记忆文档 | `/project-update` |
+
+## Agents 清单
+
+| Agent | 用途 | 调用方式 |
+|-------|------|----------|
+| `record-keeper` | 记录备份工程师 — 一键完成项目记忆更新 + Git 提交推送 | 通过 Agent 工具调用 |

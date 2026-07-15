@@ -1,5 +1,6 @@
 ---
-description: 一键Git提交推送：自动add、commit、push
+name: git-push
+description: 一键Git提交推送：自动add、commit、push。当你需要提交并推送代码时调用。
 allowed-tools: Bash(git add:*), Bash(git status:*), Bash(git commit:*), Bash(git push:*)
 ---
 

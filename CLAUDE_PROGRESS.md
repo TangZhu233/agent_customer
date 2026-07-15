@@ -8,7 +8,7 @@
 ## 当前状态
 
 - **版本**: v0.1.0
-- **最后更新**: 2026-07-14 11:10
+- **最后更新**: 2026-07-15 09:33
 - **进行中**: 无
 - **待办**: 见下方「待办事项」
 
@@ -78,6 +78,24 @@
   - `.claude/skills/project-init.md` — 新建
   - `.claude/skills/project-update.md` — 新建
 - **验证**: 两份文档结构完整，两个 Skill 指令可执行
+
+---
+
+### [2026-07-15 09:33] 基础设施: 插件命令迁移至 Skills/Agents 标准格式
+- **类型**: 基础设施
+- **问题**: 旧插件命令系统（`.claude/plugins/agent-customer-tools/`）格式不规范，缺少 Agent 定义能力，无法支持子代理独立执行任务
+- **概述**:
+  - 删除旧插件目录 `agent-customer-tools/`（4 个文件，81 行）
+  - 新建 `.claude/skills/` 目录，将 3 个命令（project-init / project-update / git-push）迁移为标准 Skill 格式（独立目录 + `SKILL.md`）
+  - 新建 `.claude/agents/record-keeper.md` Agent 定义，支持子代理独立执行备份归档任务
+- **影响文件**:
+  - 删除: `.claude/plugins/agent-customer-tools/` 全部 4 个文件
+  - 新增: `.claude/skills/project-init/SKILL.md`
+  - 新增: `.claude/skills/project-update/SKILL.md`
+  - 新增: `.claude/skills/git-push/SKILL.md`
+  - 新增: `.claude/agents/record-keeper.md`
+- **方案**: Skills 采用目录 + `SKILL.md` 标准格式，Agents 独立目录存放代理定义，与 Claude Code 官方规范对齐
+- **验证**: 3 个 Skill 可在系统内被 `/` 命令识别和调用，`record-keeper` Agent 可独立执行备份归档流程
 
 ---
 
