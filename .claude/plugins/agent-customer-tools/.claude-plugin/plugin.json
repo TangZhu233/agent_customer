@@ -1,0 +1,7 @@
+{
+  "name": "agent-customer-tools",
+  "description": "智能客服Agent项目工具集：记忆初始化、进度更新、Git推送",
+  "author": {
+    "name": "TangZhu"
+  }
+}
