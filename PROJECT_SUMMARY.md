@@ -1,6 +1,6 @@
 # 项目概览
 
-> 最后更新: 2026-07-15 | 版本: v0.2.0 | 状态: 🟢 开发中
+> 最后更新: 2026-07-16 | 版本: v0.2.1 | 状态: 🟢 开发中
 
 ---
 
@@ -47,7 +47,7 @@
 | `JWT_EXPIRE_HOURS` | Token 过期小时数 | `24` |
 | `EMBEDDING_MODEL` | 嵌入模型本地路径 | `data/models/text2vec-base-chinese` |
 | `CHROMA_DB_PATH` | ChromaDB 持久化目录 | `data/chroma_db` |
-| `VECTOR_SEARCH_K` | 向量检索返回数量 | `3` |
+| `VECTOR_SEARCH_K` | 向量检索返回数量 | `5` |
 | `RATE_LIMIT_CHAT_PER_USER` | /chat 每用户限流 | `30/minute` |
 | `RATE_LIMIT_CHAT_PER_IP` | /chat 每 IP 限流 | `60/minute` |
 | `GITHUB_TOKEN` | GitHub API Token（更新仓库描述等） | `ghp_xxx...` |
@@ -110,7 +110,9 @@ agent_customer/
 ├── db_init.py                  # 数据库初始化脚本 (7 张表)
 ├── README.md                   # 项目说明
 ├── PROJECT_SUMMARY.md          # 本文件 — 项目档案
-└── CLAUDE_PROGRESS.md          # 开发进度追踪
+├── CLAUDE_PROGRESS.md          # 开发进度追踪
+├── INTERVIEW_PREP.md           # 面试准备文档
+└── ISSUES_LOG.md               # 问题记录与修复日志
 ```
 
 ---
@@ -123,13 +125,14 @@ agent_customer/
 | `orders` | id, user_id(FK), order_no, product_name, amount, status, created_at | 8 条 |
 | `logistics` | id, order_id(FK), tracking_no, carrier, status, updates, created_at | 5 条 |
 | `auth_users` | id, username(UNIQUE), password_hash, role, created_at | 2 条 (admin/testuser) |
-| `documents` | id, title, content, category, created_at, updated_at | 19 条 (种子数据) |
+| `documents` | id, title, content, category, gender, created_at, updated_at | 19 条 (种子数据) |
 | `chat_sessions` | id, user_id(FK), title, created_at | 按需创建 |
 | `chat_messages` | id, session_id(FK), role, content, citations(JSON), created_at | 按需创建 |
 
 状态枚举: 待付款 / 已发货 / 已完成 / 已退款
 认证角色: admin (管理员) / user (普通用户)
-知识库分类: 产品信息 / 尺码指南 / 售后政策 / 面料知识 / 品牌故事
+知识库分类: 产品信息 / 尺码指南 / 售后政策 / 面料知识 / 品牌故事（支持自定义）
+知识库性别: 男 / 女 / 通用 / 儿童
 
 ---
 
@@ -139,9 +142,9 @@ agent_customer/
 2. **Agent 工具调用**: 查用户、查订单、查物流、向量检索知识库、尺码推荐（共 6 个工具）
 3. **RAG 知识问答**: ChromaDB 向量检索 + 19 条服装知识库 + 引用来源展示
 4. **用户认证**: 注册/登录/JWT 令牌/权限校验（admin/user 角色）
-5. **会话管理**: 多轮对话历史存储与恢复
-6. **知识库管理**: 文档 CRUD + 分类管理 + 向量同步（admin 权限）
-7. **企业级基础设施**: 结构化日志 + 全局异常 + API 限流 + 请求计时
+5. **会话管理**: 多轮对话历史存储与恢复 + 删除会话（级联删除消息）
+6. **知识库管理**: 文档 CRUD + 分类管理（支持自定义新增）+ 性别过滤 + 向量同步（admin 权限）+ 10 条/页分页
+7. **企业级基础设施**: 结构化日志 + 全局异常 + API 限流 + 请求计时 + 启动时数据库自动迁移
 
 ---
 

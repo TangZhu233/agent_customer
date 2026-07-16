@@ -94,6 +94,7 @@ uvicorn app.main:app --reload
 | GET | `/sessions` | 会话列表 | 必需 |
 | POST | `/sessions` | 新建会话 | 必需 |
 | GET | `/sessions/{id}/messages` | 会话历史 | 必需 |
+| DELETE | `/sessions/{id}` | 删除会话（级联删除消息） | 必需 |
 | GET | `/admin/kb/documents` | 知识库文档列表 | 管理员 |
 | POST | `/admin/kb/documents` | 添加文档 | 管理员 |
 | PUT | `/admin/kb/documents/{id}` | 更新文档 | 管理员 |
@@ -135,7 +136,8 @@ agent_customer/
 ├── requirements.txt          # pip 依赖清单
 ├── PROJECT_SUMMARY.md       # 项目档案
 ├── CLAUDE_PROGRESS.md       # 开发进度追踪
-└── INTERVIEW_PREP.md        # 面试准备文档
+├── INTERVIEW_PREP.md        # 面试准备文档
+└── ISSUES_LOG.md            # 问题记录与修复日志
 ```
 
 ## 对话示例
@@ -165,4 +167,5 @@ Agent: 根据知识库中的男装上衣尺码指南：
 | `DEEPSEEK_MODEL` | 模型名称（默认 `deepseek-v4-flash`） |
 | `JWT_SECRET_KEY` | JWT 签名密钥 |
 | `EMBEDDING_MODEL` | 嵌入模型路径 |
+| `VECTOR_SEARCH_K` | 向量检索返回数量（默认 5） |
 | `GITHUB_TOKEN` | GitHub API Token（可选） |
