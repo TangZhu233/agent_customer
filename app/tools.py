@@ -87,16 +87,19 @@ def lookup_logistics(order_id: int) -> str:
 
 # ==================== RAG 新增工具 ====================
 
-def search_knowledge_base(query: str, category: str = "全部") -> str:
+def search_knowledge_base(query: str, category: str = "全部", gender: str = "全部") -> str:
     """
     搜索服装知识库。当用户咨询服装相关问题（尺码、颜色搭配、面料洗涤保养、
     产品信息、售后政策等）时，必须先调用此工具检索知识库，再基于检索结果回答。
     参数 category 可选值：尺码指南、颜色搭配、洗涤保养、产品信息、售后政策。
+    参数 gender 可选值：男、女、通用、儿童、全部。当用户明确指定性别（如"推荐女装"）
+    时务必传入 gender 参数以缩小检索范围，提高准确率。
     """
     from app.rag import search_similar
 
     cat = None if category in ("全部", "所有", "") else category
-    results = search_similar(query, category=cat)
+    gen = None if gender in ("全部", "所有", "") else gender
+    results = search_similar(query, category=cat, gender=gen)
 
     if not results:
         return "知识库中暂无与您问题直接相关的信息。请尝试换个方式提问，或联系人工客服。"
@@ -104,8 +107,9 @@ def search_knowledge_base(query: str, category: str = "全部") -> str:
     # 格式化检索结果
     lines = [f"知识库检索结果（共{len(results)}条）："]
     for i, r in enumerate(results, 1):
+        gender_tag = f"[{r.get('gender', '通用')}]" if r.get('gender') else ""
         lines.append(
-            f"{i}. [{r['category']}] {r['title']}\n"
+            f"{i}. {gender_tag} [{r['category']}] {r['title']}\n"
             f"   {r['content'][:300]}"
         )
 
@@ -124,50 +128,101 @@ def search_knowledge_base(query: str, category: str = "全部") -> str:
     return "\n".join(lines)
 
 
-def recommend_size(height: float, weight: float, gender: str = "男", clothing_type: str = "上衣") -> str:
+def recommend_size(height: float, weight: float, gender: str = "", clothing_type: str = "上衣") -> str:
     """
     根据用户的身高(cm)、体重(kg)、性别、服装类型推荐尺码。
     当用户提供身高体重并询问尺码时，调用此工具获取推荐。
     内部会搜索知识库中的尺码指南进行匹配。
+    如果用户未提供性别或性别不明确（空字符串），会分别检索男装、女装和通用尺码建议。
     """
     from app.rag import search_similar
 
-    # 构建针对性的检索查询
-    search_query = f"{clothing_type} 尺码 {gender} 身高{int(height)} 体重{int(weight)}"
-    results = search_similar(search_query, category="尺码指南")
-
-    if not results:
-        return (
-            f"根据您提供的信息（{gender}性，身高{int(height)}cm，体重{int(weight)}kg），"
-            f"未能从知识库中匹配到精确的{clothing_type}尺码数据。"
-            f"建议您参考以下通用建议：\n"
-            f"- 身高{int(height)}cm 体重{int(weight)}kg 的{gender}性通常适合"
-            f"{'M-L码' if weight >= 60 else 'S-M码'}范围\n"
-            f"- 建议结合胸围/腰围实际测量数据选择\n"
-            f"- 可联系人工客服获取一对一尺码指导"
-        )
-
     # 存储引用
     citations = _rag_citations.get()
-    citations.extend([
-        {
-            "title": r["title"],
-            "snippet": r["content"][:150] + ("..." if len(r["content"]) > 150 else ""),
-            "category": r["category"],
-        }
-        for r in results
-    ])
+
+    # 判断是否指定了明确性别
+    known_gender = gender in ("男", "女")
+
+    if known_gender:
+        # 明确性别：精准检索
+        search_query = f"{clothing_type} 尺码 {gender} 身高{int(height)} 体重{int(weight)}"
+        results = search_similar(search_query, category="尺码指南", gender=gender)
+
+        if not results:
+            return (
+                f"根据您提供的信息（{gender}性，身高{int(height)}cm，体重{int(weight)}kg），"
+                f"未能从知识库中匹配到精确的{clothing_type}尺码数据。"
+                f"建议您参考以下通用建议：\n"
+                f"- 身高{int(height)}cm 体重{int(weight)}kg 的{gender}性通常适合"
+                f"{'M-L码' if weight >= 60 else 'S-M码'}范围\n"
+                f"- 建议结合胸围/腰围实际测量数据选择\n"
+                f"- 可联系人工客服获取一对一尺码指导"
+            )
+
+        # 收集引用
+        citations.extend([
+            {
+                "title": r["title"],
+                "snippet": r["content"][:150] + ("..." if len(r["content"]) > 150 else ""),
+                "category": r["category"],
+            }
+            for r in results
+        ])
+
+        lines = [
+            f"根据您提供的信息（{gender}性，身高{int(height)}cm，体重{int(weight)}kg），"
+            f"为您检索到以下{clothing_type}尺码参考：\n"
+        ]
+        for i, r in enumerate(results, 1):
+            lines.append(f"参考{i}：[{r['category']}] {r['title']}\n{r['content']}\n")
+        lines.append("请结合您的实际体型（如偏瘦/偏胖）和个人喜好（修身/宽松）微调。如有疑问欢迎继续咨询！")
+    else:
+        # 未知性别：分别检索男装、女装、通用尺码
+        search_query = f"{clothing_type} 尺码 身高{int(height)} 体重{int(weight)}"
+        male_results = search_similar(search_query, category="尺码指南", gender="男")
+        female_results = search_similar(search_query, category="尺码指南", gender="女")
+        general_results = search_similar(search_query, category="尺码指南", gender="通用")
+
+        # 收集引用
+        all_results = male_results + female_results + general_results
+        citations.extend([
+            {
+                "title": r["title"],
+                "snippet": r["content"][:150] + ("..." if len(r["content"]) > 150 else ""),
+                "category": r["category"],
+            }
+            for r in all_results
+        ])
+
+        lines = [
+            f"根据您提供的信息（身高{int(height)}cm，体重{int(weight)}kg），"
+            f"由于未指定性别，为您分别列出{clothing_type}尺码参考：\n"
+        ]
+
+        if male_results:
+            lines.append("─── 👨 男装推荐 ───")
+            for i, r in enumerate(male_results, 1):
+                lines.append(f"  {i}. {r['title']}\n     {r['content'][:200]}")
+            lines.append("")
+
+        if female_results:
+            lines.append("─── 👩 女装推荐 ───")
+            for i, r in enumerate(female_results, 1):
+                lines.append(f"  {i}. {r['title']}\n     {r['content'][:200]}")
+            lines.append("")
+
+        if general_results:
+            lines.append("─── 🔄 通用推荐 ───")
+            for i, r in enumerate(general_results, 1):
+                lines.append(f"  {i}. {r['title']}\n     {r['content'][:200]}")
+            lines.append("")
+
+        if not all_results:
+            lines.append("未能从知识库中匹配到精确的尺码数据。建议结合胸围/腰围实际测量数据选择，或联系人工客服获取一对一指导。")
+        else:
+            lines.append("请根据您的实际性别和体型（如偏瘦/偏胖）微调选择。如有疑问欢迎继续咨询！")
+
     _rag_citations.set(citations)
-
-    # 格式化推荐结果
-    lines = [
-        f"根据您提供的信息（{gender}性，身高{int(height)}cm，体重{int(weight)}kg），"
-        f"为您检索到以下{clothing_type}尺码参考：\n"
-    ]
-    for i, r in enumerate(results, 1):
-        lines.append(f"参考{i}：[{r['category']}] {r['title']}\n{r['content']}\n")
-    lines.append("请结合您的实际体型（如偏瘦/偏胖）和个人喜好（修身/宽松）微调。如有疑问欢迎继续咨询！")
-
     return "\n".join(lines)
 
 

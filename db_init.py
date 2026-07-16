@@ -80,6 +80,7 @@ def init_db():
             title      TEXT    NOT NULL,
             content    TEXT    NOT NULL,
             category   TEXT    NOT NULL DEFAULT '通用',
+            gender     TEXT    NOT NULL DEFAULT '通用',
             created_at TEXT    NOT NULL,
             updated_at TEXT    NOT NULL
         )

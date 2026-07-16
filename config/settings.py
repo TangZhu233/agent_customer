@@ -45,7 +45,7 @@ class Settings:
     # ChromaDB 持久化目录（相对于项目根目录）
     CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "data/chroma_db")
     # 向量检索返回数量
-    VECTOR_SEARCH_K: int = int(os.getenv("VECTOR_SEARCH_K", "3"))
+    VECTOR_SEARCH_K: int = int(os.getenv("VECTOR_SEARCH_K", "5"))
 
     # --- API 限流 ---
     # /chat 接口每分钟每用户最大请求数

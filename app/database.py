@@ -106,14 +106,14 @@ def update_password(user_id: int, new_hash: str) -> None:
 
 # ==================== 知识库文档管理（新增）====================
 
-def create_document(title: str, content: str, category: str) -> int:
+def create_document(title: str, content: str, category: str, gender: str = "通用") -> int:
     """创建知识库文档，返回文档 ID"""
     from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO documents (title, content, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (title, content, category, now, now),
+        "INSERT INTO documents (title, content, category, gender, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (title, content, category, gender, now, now),
     )
     doc_id = cur.lastrowid
     conn.commit()
@@ -129,7 +129,7 @@ def get_document_by_id(doc_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def update_document(doc_id: int, title: str | None, content: str | None, category: str | None) -> bool:
+def update_document(doc_id: int, title: str | None, content: str | None, category: str | None, gender: str | None = None) -> bool:
     """更新文档（只更新非 None 字段），返回是否成功"""
     from datetime import datetime
     fields = []
@@ -143,6 +143,9 @@ def update_document(doc_id: int, title: str | None, content: str | None, categor
     if category is not None:
         fields.append("category = ?")
         values.append(category)
+    if gender is not None:
+        fields.append("gender = ?")
+        values.append(gender)
     if not fields:
         return False
     fields.append("updated_at = ?")
@@ -259,6 +262,22 @@ def get_session_messages(session_id: int, user_id: int) -> list[dict]:
     return results
 
 
+def delete_session(session_id: int, user_id: int) -> bool:
+    """删除会话及其所有消息（需验证所有权），返回是否成功"""
+    conn = get_connection()
+    session = conn.execute(
+        "SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?", (session_id, user_id)
+    ).fetchone()
+    if not session:
+        conn.close()
+        return False
+    conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
 def save_message(session_id: int, user_id: int, role: str, content: str, citations: str | None = None) -> int:
     """保存消息，返回消息 ID"""
     from datetime import datetime
@@ -280,3 +299,29 @@ def save_message(session_id: int, user_id: int, role: str, content: str, citatio
     conn.commit()
     conn.close()
     return msg_id
+
+
+# ==================== 数据库迁移 ====================
+
+def migrate_database() -> None:
+    """
+    自动迁移：为旧数据库添加新增字段，避免手动重建。
+    每次新增列时在此追加 ALTER TABLE 语句，幂等执行（列已存在则跳过）。
+    """
+    conn = get_connection()
+    migrations = [
+        # v0.2.1: documents 表新增 gender 列
+        "ALTER TABLE documents ADD COLUMN gender TEXT NOT NULL DEFAULT '通用'",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+            print(f"[MIGRATE] 已执行: {sql[:60]}...")
+        except sqlite3.OperationalError as e:
+            # 列已存在则跳过
+            if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                pass
+            else:
+                raise
+    conn.close()

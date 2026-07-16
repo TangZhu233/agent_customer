@@ -102,6 +102,7 @@ class DocumentCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
     content: str = Field(..., min_length=1)
     category: str = Field(default="通用", max_length=50)
+    gender: str = Field(default="通用", max_length=10)
 
 
 class DocumentUpdate(BaseModel):
@@ -109,6 +110,7 @@ class DocumentUpdate(BaseModel):
     title: str | None = Field(None, max_length=200)
     content: str | None = None
     category: str | None = Field(None, max_length=50)
+    gender: str | None = Field(None, max_length=10)
 
 
 class DocumentResponse(BaseModel):
@@ -117,6 +119,7 @@ class DocumentResponse(BaseModel):
     title: str
     content: str
     category: str
+    gender: str
     created_at: str
     updated_at: str
 

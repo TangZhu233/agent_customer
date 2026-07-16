@@ -67,8 +67,9 @@ def _get_vectorstore() -> Chroma:
 
 # ==================== 文档同步操作 ====================
 
-def add_document(doc_id: int, title: str, content: str, category: str) -> None:
+def add_document(doc_id: int, title: str, content: str, category: str, gender: str = "通用") -> None:
     """将文档嵌入后添加到 ChromaDB"""
+    global _vectorstore
     with _write_lock:
         vs = _get_vectorstore()
         vs.add_texts(
@@ -77,14 +78,18 @@ def add_document(doc_id: int, title: str, content: str, category: str) -> None:
                 "doc_id": str(doc_id),
                 "title": title,
                 "category": category,
+                "gender": gender,
             }],
             ids=[f"doc_{doc_id}"],
         )
-    rag_log.info("向量已添加: doc_id=%d title=%s category=%s", doc_id, title, category)
+        # 写入后重置单例，确保下次检索从磁盘读取最新数据
+        _vectorstore = None
+    rag_log.info("向量已添加: doc_id=%d title=%s category=%s gender=%s", doc_id, title, category, gender)
 
 
-def update_document(doc_id: int, title: str, content: str, category: str) -> None:
+def update_document(doc_id: int, title: str, content: str, category: str, gender: str = "通用") -> None:
     """更新文档：先删除旧向量，再添加新向量"""
+    global _vectorstore
     with _write_lock:
         vs = _get_vectorstore()
         chroma_id = f"doc_{doc_id}"
@@ -100,18 +105,24 @@ def update_document(doc_id: int, title: str, content: str, category: str) -> Non
                 "doc_id": str(doc_id),
                 "title": title,
                 "category": category,
+                "gender": gender,
             }],
             ids=[chroma_id],
         )
-    rag_log.info("向量已更新: doc_id=%d title=%s", doc_id, title)
+        # 写入后重置单例，确保下次检索从磁盘读取最新数据
+        _vectorstore = None
+    rag_log.info("向量已更新: doc_id=%d title=%s gender=%s", doc_id, title, gender)
 
 
 def delete_document(doc_id: int) -> None:
     """从 ChromaDB 删除文档向量"""
+    global _vectorstore
     with _write_lock:
         vs = _get_vectorstore()
         try:
             vs.delete(ids=[f"doc_{doc_id}"])
+            # 写入后重置单例，确保下次检索从磁盘读取最新数据
+            _vectorstore = None
             rag_log.info("向量已删除: doc_id=%d", doc_id)
         except Exception as e:
             rag_log.warning("删除向量失败: doc_id=%d error=%s", doc_id, e)
@@ -119,7 +130,7 @@ def delete_document(doc_id: int) -> None:
 
 # ==================== 检索操作 ====================
 
-def search_similar(query: str, k: int | None = None, category: str | None = None) -> list[dict]:
+def search_similar(query: str, k: int | None = None, category: str | None = None, gender: str | None = None) -> list[dict]:
     """
     向量相似检索。
 
@@ -127,9 +138,10 @@ def search_similar(query: str, k: int | None = None, category: str | None = None
         query: 用户查询文本
         k: 返回结果数（默认取配置）
         category: 可选，按分类过滤（如 "尺码指南"）
+        gender: 可选，按性别过滤（"男"/"女"/"通用"/"儿童"）
 
     返回:
-        [{doc_id, title, content, category, score}, ...]
+        [{doc_id, title, content, category, gender, score}, ...]
         score 为距离值，越小越相似（0 = 完全匹配）
 
     面试知识点：
@@ -144,17 +156,35 @@ def search_similar(query: str, k: int | None = None, category: str | None = None
     k = k or settings.VECTOR_SEARCH_K
     vs = _get_vectorstore()
 
-    # 构建过滤条件
+    # 构建组合过滤条件
     where_filter = None
+    conditions = []
     if category:
-        where_filter = {"category": category}
+        conditions.append({"category": category})
+    if gender:
+        conditions.append({"gender": gender})
+
+    if len(conditions) == 1:
+        where_filter = conditions[0]
+    elif len(conditions) > 1:
+        where_filter = {"$and": conditions}
 
     start = time.perf_counter()
     try:
         results = vs.similarity_search_with_score(query, k=k, filter=where_filter)
     except Exception as e:
-        rag_log.error("向量检索异常: %s", e)
-        return []
+        # 如果组合过滤失败（如旧数据无 gender 字段），降级为只按 category 过滤
+        if where_filter and gender:
+            rag_log.warning("组合过滤失败，降级为仅 category 过滤: %s", e)
+            fallback_filter = {"category": category} if category else None
+            try:
+                results = vs.similarity_search_with_score(query, k=k, filter=fallback_filter)
+            except Exception as e2:
+                rag_log.error("降级检索也失败: %s", e2)
+                return []
+        else:
+            rag_log.error("向量检索异常: %s", e)
+            return []
 
     elapsed = round((time.perf_counter() - start) * 1000, 2)
 
@@ -165,12 +195,13 @@ def search_similar(query: str, k: int | None = None, category: str | None = None
             "title": doc.metadata.get("title", ""),
             "content": doc.page_content,
             "category": doc.metadata.get("category", ""),
+            "gender": doc.metadata.get("gender", "通用"),
             "score": round(score, 4),
         })
 
     rag_log.info(
-        "向量检索: query='%s' category=%s k=%d → %d条结果 %.2fms",
-        query[:50], category or "全部", k, len(docs), elapsed,
+        "向量检索: query='%s' category=%s gender=%s k=%d → %d条结果 %.2fms",
+        query[:50], category or "全部", gender or "全部", k, len(docs), elapsed,
     )
     return docs
 
@@ -194,8 +225,9 @@ def seed_knowledge_base() -> int:
 
     count = 0
     for doc in DEFAULT_DOCUMENTS:
-        doc_id = create_document(doc["title"], doc["content"], doc["category"])
-        add_document(doc_id, doc["title"], doc["content"], doc["category"])
+        gender = doc.get("gender", "通用")
+        doc_id = create_document(doc["title"], doc["content"], doc["category"], gender)
+        add_document(doc_id, doc["title"], doc["content"], doc["category"], gender)
         count += 1
 
     rag_log.info("知识库种子初始化完成: %d 条文档", count)

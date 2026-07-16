@@ -36,7 +36,9 @@ setup_middleware(app)
 
 @app.on_event("startup")
 async def startup():
-    app_log.info("服装电商智能客服 v0.2.0 启动")
+    from app.database import migrate_database
+    migrate_database()
+    app_log.info("服装电商智能客服 v0.2.1 启动")
 
 
 # ==================== 认证路由 ====================
@@ -113,6 +115,17 @@ async def create_session(req: SessionCreateRequest = None, user: dict = Depends(
     )
 
 
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: int, user: dict = Depends(get_current_user)):
+    """删除会话及其所有消息"""
+    from app.database import delete_session as db_delete_session
+
+    if not db_delete_session(session_id, user["user_id"]):
+        raise HTTPException(status_code=404, detail="会话不存在或无权操作")
+    app_log.info("会话已删除: id=%d user=%d", session_id, user["user_id"])
+    return {"message": "会话已删除"}
+
+
 @app.get("/sessions/{session_id}/messages", response_model=list[SessionMessage])
 async def get_session_messages(session_id: int, user: dict = Depends(get_current_user)):
     """获取会话历史消息（含引用）"""
@@ -168,9 +181,9 @@ async def admin_create_document(
     from app.database import create_document
     from app.rag import add_document as rag_add
 
-    doc_id = create_document(req.title, req.content, req.category)
-    rag_add(doc_id, req.title, req.content, req.category)
-    app_log.info("管理员添加文档: id=%d title=%s", doc_id, req.title)
+    doc_id = create_document(req.title, req.content, req.category, req.gender)
+    rag_add(doc_id, req.title, req.content, req.category, req.gender)
+    app_log.info("管理员添加文档: id=%d title=%s gender=%s", doc_id, req.title, req.gender)
     return {"id": doc_id, "message": "文档添加成功"}
 
 
@@ -188,10 +201,10 @@ async def admin_update_document(
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
 
-    update_document(doc_id, req.title, req.content, req.category)
+    update_document(doc_id, req.title, req.content, req.category, req.gender)
     # 获取更新后的文档用于重新嵌入
     updated = get_document_by_id(doc_id)
-    rag_update(doc_id, updated["title"], updated["content"], updated["category"])
+    rag_update(doc_id, updated["title"], updated["content"], updated["category"], updated.get("gender", "通用"))
     app_log.info("管理员更新文档: id=%d", doc_id)
     return {"message": "文档更新成功"}
 
@@ -395,6 +408,13 @@ CHAT_PAGE = r"""
         }
         .session-item:hover { background: #f0f2f5; }
         .session-item.active { background: #eef1ff; color: var(--primary); font-weight: 600; }
+        .session-item { display: flex; justify-content: space-between; align-items: center; }
+        .session-item .del-session {
+            visibility: hidden; font-size: 16px; color: #ccc; cursor: pointer;
+            padding: 2px 6px; border-radius: 4px; line-height: 1;
+        }
+        .session-item:hover .del-session { visibility: visible; }
+        .session-item .del-session:hover { color: var(--danger); background: #fde8e8; }
         .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
         .topbar {
             height: var(--header-h); background: var(--white); border-bottom: 1px solid var(--border);
@@ -594,7 +614,7 @@ CHAT_PAGE = r"""
             </div>
             <table>
                 <thead>
-                    <tr><th>ID</th><th>标题</th><th>分类</th><th>更新时间</th><th>操作</th></tr>
+                    <tr><th>ID</th><th>标题</th><th>分类</th><th>性别</th><th>更新时间</th><th>操作</th></tr>
                 </thead>
                 <tbody id="doc-table-body"></tbody>
             </table>
@@ -608,7 +628,19 @@ CHAT_PAGE = r"""
     <div class="modal">
         <h3 id="doc-modal-title">添加文档</h3>
         <div class="form-group"><label>标题</label><input id="doc-title" placeholder="文档标题"></div>
-        <div class="form-group"><label>分类</label><select id="doc-category"><option value="通用">通用</option></select></div>
+        <div class="form-group">
+            <label>分类</label>
+            <div style="display:flex;gap:8px;">
+                <select id="doc-category" style="flex:1;"></select>
+                <button type="button" class="btn btn-outline btn-sm" id="btn-add-cat" onclick="showAddCategory()">＋ 新增</button>
+            </div>
+            <div id="add-cat-wrap" style="display:none;margin-top:8px;gap:6px;">
+                <input id="new-cat-name" placeholder="输入新分类名称" style="flex:1;">
+                <button type="button" class="btn btn-primary btn-sm" onclick="confirmAddCategory()">确认</button>
+                <button type="button" class="btn btn-outline btn-sm" onclick="cancelAddCategory()">取消</button>
+            </div>
+        </div>
+        <div class="form-group"><label>适用性别</label><select id="doc-gender"><option value="通用">通用</option><option value="男">男</option><option value="女">女</option><option value="儿童">儿童</option></select></div>
         <div class="form-group"><label>内容</label><textarea id="doc-content" placeholder="文档正文内容" rows="6"></textarea></div>
         <input type="hidden" id="doc-edit-id" value="">
         <div class="form-actions">
@@ -675,6 +707,13 @@ function switchAuthTab(tab) {
     document.getElementById('tab-register').classList.toggle('active', tab === 'register');
     document.getElementById('form-login').style.display = tab === 'login' ? '' : 'none';
     document.getElementById('form-register').style.display = tab === 'register' ? '' : 'none';
+    // 切换时清空所有输入框和错误提示
+    document.getElementById('login-username').value = '';
+    document.getElementById('login-password').value = '';
+    document.getElementById('login-error').style.display = 'none';
+    document.getElementById('reg-username').value = '';
+    document.getElementById('reg-password').value = '';
+    document.getElementById('reg-error').style.display = 'none';
 }
 
 async function handleLogin(e) {
@@ -708,8 +747,11 @@ async function handleRegister(e) {
     try {
         await api('POST', '/auth/register', { username: uname, password: pwd });
         toast('注册成功，请登录', 'success');
+        // 清空注册表单并切换到登录
+        document.getElementById('reg-username').value = '';
+        document.getElementById('reg-password').value = '';
+        document.getElementById('reg-error').style.display = 'none';
         switchAuthTab('login');
-        document.getElementById('login-username').value = uname;
     } catch (err) {
         errEl.textContent = err.message;
         errEl.style.display = 'block';
@@ -816,21 +858,46 @@ document.getElementById('inp').addEventListener('keydown', e => { if (e.key === 
 
 // ==================== 会话管理 ====================
 async function loadSessions() {
-    if (!TOKEN) return;
+    if (!TOKEN) return [];
     try {
         const sessions = await api('GET', '/sessions');
         const list = document.getElementById('session-list');
         list.innerHTML = sessions.map(s =>
-            '<div class="session-item' + (s.id === currentSessionId ? ' active' : '') +
-            '" onclick="switchSession(' + s.id + ')">' +
-            escHtml(s.session_title) + ' <span style="font-size:11px;color:#999;">(' + s.message_count + '条)</span></div>'
+            '<div class="session-item' + (s.id === currentSessionId ? ' active' : '') + '">' +
+            '<span onclick="switchSession(' + s.id + ')" style="flex:1;overflow:hidden;text-overflow:ellipsis;">' +
+            escHtml(s.session_title) + ' <span style="font-size:11px;color:#999;">(' + s.message_count + '条)</span></span>' +
+            '<span class="del-session" title="删除对话" onclick="deleteSession(event, ' + s.id + ')">✕</span></div>'
         ).join('');
-    } catch(e) {}
+        return sessions;
+    } catch(e) { return []; }
+}
+
+async function deleteSession(e, sid) {
+    e.stopPropagation();
+    if (!confirm('确定要删除此对话吗？删除后不可恢复。')) return;
+    try {
+        await api('DELETE', '/sessions/' + sid);
+        if (currentSessionId === sid) {
+            currentSessionId = null;
+            document.getElementById('msgs').innerHTML = '<div class="msg ai">对话已删除。点击「＋ 新建对话」开始新咨询。</div>';
+        }
+        toast('对话已删除', 'success');
+        loadSessions();
+    } catch(e) { toast('删除失败: ' + e.message, 'error'); }
 }
 
 async function newSession() {
     if (!TOKEN) return;
     try {
+        // 检查是否已有空会话（避免重复创建）
+        const sessions = await api('GET', '/sessions');
+        const emptySession = sessions.find(function(s) { return s.message_count === 0; });
+        if (emptySession) {
+            // 已有空会话，直接切换过去
+            switchSession(emptySession.id);
+            return;
+        }
+        // 没有空会话，创建新的
         const s = await api('POST', '/sessions', { title: '新对话' });
         currentSessionId = s.id;
         document.getElementById('msgs').innerHTML = '<div class="msg ai">新对话已开始！有什么服装相关的问题想问我？</div>';
@@ -841,6 +908,7 @@ async function newSession() {
 async function switchSession(sid) {
     currentSessionId = sid;
     document.getElementById('msgs').innerHTML = '';
+    document.getElementById('inp').value = '';
     try {
         const msgs = await api('GET', '/sessions/' + sid + '/messages');
         msgs.forEach(m => addMsg(m.content, m.role, m.citations));
@@ -869,16 +937,16 @@ async function loadDocs(page) {
     if (page) currentPage = page;
     const cat = document.getElementById('kb-cat-filter').value;
     try {
-        const data = await api('GET', '/admin/kb/documents?category=' + encodeURIComponent(cat) + '&page=' + currentPage + '&page_size=20');
+        const data = await api('GET', '/admin/kb/documents?category=' + encodeURIComponent(cat) + '&page=' + currentPage + '&page_size=10');
         const tbody = document.getElementById('doc-table-body');
         tbody.innerHTML = data.items.map(d =>
             '<tr><td>' + d.id + '</td><td>' + escHtml(d.title) + '</td><td>' + escHtml(d.category) +
-            '</td><td>' + d.updated_at + '</td><td class="actions">' +
-            '<button class="btn btn-outline btn-sm" onclick="editDoc(' + d.id + ',\'' + escHtml(d.title) + '\',\'' + escHtml(d.category) + '\',\'' + escHtml(d.content.replace(/'/g, "\\'").replace(/\n/g, '\\n')) + '\')">编辑</button>' +
+            '</td><td>' + escHtml(d.gender || '通用') + '</td><td>' + d.updated_at + '</td><td class="actions">' +
+            '<button class="btn btn-outline btn-sm" onclick="editDoc(' + d.id + ',\'' + escHtml(d.title) + '\',\'' + escHtml(d.category) + '\',\'' + escHtml(d.gender || '通用') + '\',\'' + escHtml(d.content.replace(/'/g, "\\'").replace(/\n/g, '\\n')) + '\')">编辑</button>' +
             '<button class="btn btn-danger btn-sm" onclick="deleteDoc(' + d.id + ')">删除</button></td></tr>'
         ).join('');
-        // Pagination
-        const totalPages = Math.ceil(data.total / 20);
+        // Pagination (10 per page)
+        const totalPages = Math.ceil(data.total / 10);
         let pag = '';
         for (let i = 1; i <= totalPages; i++) {
             pag += '<button class="btn btn-sm ' + (i === currentPage ? 'btn-primary' : 'btn-outline') +
@@ -891,12 +959,63 @@ async function loadDocs(page) {
 async function loadCategories() {
     try {
         const cats = await api('GET', '/admin/kb/categories');
+        // 更新筛选下拉框
         const sel = document.getElementById('kb-cat-filter');
-        sel.innerHTML = '<option value="">全部分类</option>' + cats.map(c => '<option>' + escHtml(c) + '</option>').join('');
-        // Also update modal category select
-        const mSel = document.getElementById('doc-category');
-        mSel.innerHTML = cats.map(c => '<option>' + escHtml(c) + '</option>').join('') + '<option value="通用">通用</option>';
-    } catch(e) {}
+        if (sel) {
+            sel.innerHTML = '<option value="">全部分类</option>' + cats.map(c => '<option>' + escHtml(c) + '</option>').join('');
+        }
+        // 更新弹窗分类下拉框
+        const docSel = document.getElementById('doc-category');
+        if (docSel) {
+            docSel.innerHTML = cats.map(c => '<option value="' + escHtml(c) + '">' + escHtml(c) + '</option>').join('');
+        }
+    } catch(e) {
+        console.error('加载分类失败:', e);
+        var defaults = ['尺码指南','颜色搭配','洗涤保养','产品信息','售后政策','通用'];
+        var sel = document.getElementById('kb-cat-filter');
+        if (sel && sel.options.length <= 1) {
+            sel.innerHTML = '<option value="">全部分类</option>' + defaults.map(function(c){ return '<option>' + c + '</option>'; }).join('');
+        }
+        var docSel = document.getElementById('doc-category');
+        if (docSel && docSel.options.length === 0) {
+            docSel.innerHTML = defaults.map(function(c){ return '<option value="' + c + '">' + c + '</option>'; }).join('');
+        }
+    }
+}
+
+// ==================== 新增分类 ====================
+function showAddCategory() {
+    document.getElementById('add-cat-wrap').style.display = 'flex';
+    document.getElementById('btn-add-cat').style.display = 'none';
+    document.getElementById('new-cat-name').value = '';
+    document.getElementById('new-cat-name').focus();
+}
+
+function cancelAddCategory() {
+    document.getElementById('add-cat-wrap').style.display = 'none';
+    document.getElementById('btn-add-cat').style.display = '';
+    document.getElementById('new-cat-name').value = '';
+}
+
+function confirmAddCategory() {
+    var name = document.getElementById('new-cat-name').value.trim();
+    if (!name) return toast('请输入分类名称', 'error');
+    // 检查是否已存在
+    var sel = document.getElementById('doc-category');
+    for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === name) {
+            toast('该分类已存在', 'error');
+            return;
+        }
+    }
+    // 添加到下拉框并选中
+    var opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+    sel.value = name;
+    cancelAddCategory();
+    toast('分类「' + name + '」已添加（保存文档后生效）', 'success');
 }
 
 function openDocModal(doc) {
@@ -904,29 +1023,33 @@ function openDocModal(doc) {
     document.getElementById('doc-modal-title').textContent = doc ? '编辑文档' : '添加文档';
     document.getElementById('doc-title').value = doc ? doc.title : '';
     document.getElementById('doc-category').value = doc ? doc.category : '通用';
+    document.getElementById('doc-gender').value = doc ? (doc.gender || '通用') : '通用';
     document.getElementById('doc-content').value = doc ? doc.content : '';
     document.getElementById('doc-modal').classList.add('show');
 }
 function closeDocModal() { document.getElementById('doc-modal').classList.remove('show'); }
 
-function editDoc(id, title, category, content) {
-    openDocModal({ id, title, category, content });
+function editDoc(id, title, category, gender, content) {
+    openDocModal({ id, title, category, gender, content });
 }
 
 async function saveDoc() {
     const id = document.getElementById('doc-edit-id').value;
     const title = document.getElementById('doc-title').value.trim();
-    const category = document.getElementById('doc-category').value;
+    const category = document.getElementById('doc-category').value.trim();
+    const gender = document.getElementById('doc-gender').value;
     const content = document.getElementById('doc-content').value.trim();
     if (!title || !content) return toast('标题和内容不能为空', 'error');
+    if (!category) return toast('分类不能为空', 'error');
     try {
         if (id) {
-            await api('PUT', '/admin/kb/documents/' + id, { title, category, content });
+            await api('PUT', '/admin/kb/documents/' + id, { title, category, content, gender });
         } else {
-            await api('POST', '/admin/kb/documents', { title, category, content });
+            await api('POST', '/admin/kb/documents', { title, category, content, gender });
         }
         closeDocModal();
         loadDocs();
+        loadCategories();  // 刷新分类列表（可能有新分类）
         toast(id ? '文档更新成功' : '文档添加成功', 'success');
     } catch(e) { toast('保存失败: ' + e.message, 'error'); }
 }
@@ -959,8 +1082,11 @@ window.onload = function() {
         document.getElementById('current-username').textContent = USER.username;
         document.getElementById('admin-link').style.display = USER.is_admin ? '' : 'none';
         showPage('chat');
-        loadSessions();
-        newSession();
+        loadSessions().then(function(sessions) {
+            if (!sessions || sessions.length === 0) {
+                newSession();
+            }
+        });
     } else {
         showPage('login');
     }
