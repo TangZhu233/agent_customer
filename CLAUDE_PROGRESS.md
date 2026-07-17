@@ -7,7 +7,7 @@
 
 ## 当前状态
 
-- **版本**: v0.3.0
+- **版本**: v0.3.1
 - **最后更新**: 2026-07-17
 - **进行中**: 无
 - **待办**: 见下方「待办事项」
@@ -275,16 +275,70 @@
 
 ---
 
+### [2026-07-17] 功能开发: 流式对话响应 + 压测结果分析 + 性能优化方案
+
+- **类型**: 功能开发 + 性能评估
+- **问题**: 用户每次提问需等待 9~17 秒才能看到完整回复（LLM Agent 2~3 次推理串行执行），体验差；压测仪表盘已完成但缺乏系统化的结果分析和优化路线
+- **概述**:
+  - **压测分析**: 10人 QPS=0.69 P50=8.7s, 100人 QPS=4.03 P50=17.3s, 成功率100%。瓶颈在 DeepSeek API 延迟（每次 LLM 推理 3~7s，每个对话 2~3 次），非应用层代码
+  - **流式对话**: `app/agent.py` 新增 `chat_stream()` 异步生成器，用 `agent.astream_events(version="v2")` 实现逐 token 推送。核心技术点：按 `run_id` 分组追踪 LLM 调用，只推送最后一次调用的 token（最终回答），跳过工具选择阶段的内部推理；新 LLM 轮次开始时发送 `clear` 事件让前端丢弃中间内容
+  - **前端流式渲染**: `send()` 改用 `fetch + ReadableStream + NDJSON`，`createStreamingMsg()` 创建空消息气泡，`finalizeStreamingMsg()` 在流结束后渲染引用。首字节延迟从 9,330ms 降至 2,051ms（感知提升 4.5x）
+  - **消息持久化**: 流式端点内收集完整回复，流结束后自动保存到 SQLite
+  - **优化路线图**: 流式→Prompt Caching→Semaphore控流→语义缓存→并行工具调用（五阶段，ROI 递减）
+  - `ChatRequest` 新增 `stream: bool = False`，向后兼容
+  - `requirements.txt` 新增 `langgraph>=1.0.0`
+
+- **影响文件**:
+  - 修改: `app/agent.py`, `app/models.py`, `app/main.py`, `requirements.txt`
+- **方案**: NDJSON（Newline Delimited JSON）一行一个事件，与压测端点格式统一。ReAct Agent 至少 2 次 LLM 调用，按 run_id 智能过滤只推送最终回答的 token
+- **验证**: 流式首字节 2,051ms（↓78%）, 非流式向后兼容 9,330ms, 前端 JS 括号平衡, 登录/注册/会话/管理后台全链路正常工作
+
+---
+
+### [2026-07-17] 修复: 流式对话实现过程中的 3 个 JS 语法错误
+
+- **类型**: Bug 修复
+- **问题**: 流式对话代码通过 Python 脚本注入 `main.py` HTML 模板时，Python 字符串转义导致 JS 产生三个语法错误：(1) `\n` 正则被解析为真实换行，`replace(/\n/g` 断裂为两行 (2) 旧 `send()` 函数头 `async function send() {` 未完全删除，残留无闭合的 `{` (3) `finalizeStreamingMsg` 函数结尾 `}` 丢失
+- **概述**: 三个错误叠加导致 JS `{` 比 `}` 多 3 个，浏览器解析失败，整个 `<script>` 块全部瘫痪，页面所有交互（登录/注册/聊天/管理后台）不可用
+- **影响文件**: `app/main.py`
+- **方案**: 用 Python 脚本逐一定位修复（主文件为 Python raw string `r"""..."""`，不能用 Edit 工具跨行匹配），最终 JS 括号计数 `{143}` vs `{143}` 完全平衡
+- **验证**: 登录 API 200, 页面所有 JS 函数完整, 流式首 token 971ms, 全链路测试通过
+
+
 ## 待办事项
 
 | 优先级 | 内容 | 状态 |
 |--------|------|------|
-| P1 | ~~多轮对话上下文记忆~~ | 已完成（chat_sessions 实现） |
-| P1 | ~~聊天页面历史记录保存~~ | 已完成 |
+| P1 | ~~流式对话响应~~ | 已完成（v0.3.1） |
+| P1 | ~~压测仪表盘 + 结果分析~~ | 已完成 |
+| P2 | Prompt Caching（DeepSeek API 侧缓存系统提示词） | 待开发 |
 | P2 | 增加"退换货处理"工具 | 待开发 |
 | P2 | ~~用户认证（登录后只能查自己订单）~~ | 已完成（JWT + bcrypt） |
+| P3 | 语义缓存（向量相似度匹配历史问答） | 待规划 |
 | P3 | 部署到服务器/云平台 | 待规划 |
 | P3 | 对接企业微信/飞书等 IM | 待规划 |
+
+---
+
+## 防御性检查清单
+
+> 以下约束由历次 Bug 修复提炼而来，每次修改相关代码后必须执行。
+
+| # | 触发条件 | 检查项 | 来源 |
+|---|---------|--------|------|
+| 1 | 修改 `CHAT_PAGE` 或 `BENCHMARK_PAGE` raw string 内的 JavaScript | `curl -s http://localhost:8000/ -o /tmp/page.html && python -c "..."` 提取 `<script>` 内容 → `node --check` 验证语法无误 | 批次 #3 + #4：Python raw string 中的字面换行导致 JS 语法错误，整个页面 JS 瘫痪 |
+
+执行方法（Windows 环境）：
+```bash
+# 修改 main.py 后，验证聊天页 JS 语法
+curl -s http://localhost:8000/ -o ~/page.html
+python -c "
+content = open('C:/Users/Administrator/page.html','r',encoding='utf-8').read()
+s = content.find('<script>'); e = content.find('</script>')
+open('C:/Users/Administrator/_check.js','w',encoding='utf-8').write(content[s+8:e])
+"
+node --check C:/Users/Administrator/_check.js && echo "OK" || echo "FAIL"
+```
 
 ---
 

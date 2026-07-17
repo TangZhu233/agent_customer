@@ -1,6 +1,6 @@
 # 项目概览
 
-> 最后更新: 2026-07-16 | 版本: v0.3.0 | 状态: 🟢 开发中
+> 最后更新: 2026-07-17 | 版本: v0.3.1 | 状态: 🟢 开发中
 
 ---
 
@@ -23,13 +23,14 @@
 | 层级 | 技术 | 版本 |
 |------|------|------|
 | Web 框架 | FastAPI + Uvicorn | 0.139+ |
-| AI 框架 | LangChain + LangGraph (ReAct) | 1.3.13 / 1.2.9 |
+| AI 框架 | LangChain + LangGraph (ReAct) | 1.3.13 / 1.2.9 / 1.0.0+ |
 | LLM 模型 | DeepSeek | deepseek-v4-flash (推荐) / deepseek-v4-pro |
 | 数据库 | SQLite 3 | - |
 | 向量数据库 | ChromaDB (嵌入式) | 0.5+ |
 | 嵌入模型 | sentence-transformers (text2vec-base-chinese) | 3.0+ |
 | 用户认证 | passlib[bcrypt] + python-jose (JWT) | 1.7+ / 3.3+ |
 | API 限流 | slowapi | 0.1+ |
+| 压测引擎 | httpx | 0.27+ |
 | 配置管理 | python-dotenv | 1.2+ |
 | 数据校验 | Pydantic | 2.13+ |
 
@@ -65,6 +66,8 @@
 - ⚠️ HuggingFace 模型下载使用 hf-mirror.com 国内镜像（见 config/settings.py）
 - ⚠️ ChromaDB 写入操作受 threading.Lock 保护（SQLite 底层非线程安全）
 - ⚠️ 嵌入模型 (text2vec-base-chinese) 需预下载至 `data/models/` 目录
+- ⚠️ 修改 `app/main.py` 内嵌 JS 后必须 `node --check` 验证语法（见 CLAUDE_PROGRESS.md 防御性检查清单）
+- ⚠️ 流式对话依赖 `langgraph>=1.0.0`，国内安装需清华镜像源
 
 ---
 
@@ -74,7 +77,7 @@
 agent_customer/
 ├── app/                        # 应用核心代码
 │   ├── __init__.py
-│   ├── main.py                 # FastAPI 入口 + 多页面 HTML + 20 个 API
+│   ├── main.py                 # FastAPI 入口 + 多页面 HTML + 22 个 API（含流式对话 + 压测）
 │   ├── agent.py                # LangChain ReAct Agent (RAG 增强 + 重试)
 │   ├── tools.py                # 6 个 Agent 工具函数 (含 RAG)
 │   ├── models.py               # Pydantic 请求/响应模型 (22 个类)
@@ -83,6 +86,7 @@ agent_customer/
 │   ├── logger.py               # 结构化日志 (api/rag/llm/auth)
 │   ├── middleware.py           # 全局异常 + 请求计时 + 限流
 │   ├── rag.py                  # ChromaDB 向量存储 + 嵌入 + 检索 + 索引重建
+│   ├── benchmark.py              # 服务端压测引擎（异步并发 + 延迟分位数统计）
 │   └── kb_seed_data.py         # 27 条服装知识库种子数据 (含 8 篇 SKU)
 ├── config/
 │   ├── __init__.py
@@ -106,7 +110,7 @@ agent_customer/
 ├── .env                        # 真实密钥 (不入 Git)
 ├── .env.example                # 配置模板
 ├── .gitignore
-├── requirements.txt            # pip 依赖清单 (17 个包)
+├── requirements.txt            # pip 依赖清单 (17 个包，含 langgraph + httpx)
 ├── db_init.py                  # 数据库初始化脚本 (6 张表 + 服装种子数据)
 ├── README.md                   # 项目说明
 ├── PROJECT_SUMMARY.md          # 本文件 — 项目档案
@@ -140,12 +144,14 @@ agent_customer/
 ## 核心功能
 
 1. **多页面 Web 前端**: 登录页 / 智能客服聊天 / 管理后台（三标签：用户管理+订单管理+文档管理）→ http://localhost:8000
-2. **Agent 工具调用**: 查用户、查订单、查物流、向量检索知识库、尺码推荐（共 6 个工具）
-3. **RAG 知识问答**: ChromaDB 向量检索 + 27 条服装知识库（含 8 篇具体 SKU 参数文档）+ 引用来源展示
-4. **用户认证**: 注册/登录/JWT 令牌/权限校验（admin/user 角色，统一 users 表管理）
-5. **会话管理**: 多轮对话历史存储与恢复 + 删除会话（级联删除消息）
-6. **管理后台**: 三标签界面 — 用户管理（列表查看）/ 订单管理（列表+详情，JOIN 返回用户信息）/ 文档管理（CRUD + 分类管理 + 性别过滤 + 10 条/页分页 + 索引重建）
-7. **企业级基础设施**: 结构化日志 + 全局异常 + API 限流 + 请求计时 + 启动时数据库自动迁移（检测旧 schema 自动删库重建）
+2. **流式对话响应**: SSE/NDJSON 流式推送，逐 token 渲染，首字节延迟降低 78%（从 9.3s 降至 2.1s）
+3. **Agent 工具调用**: 查用户、查订单、查物流、向量检索知识库、尺码推荐（共 6 个工具）
+4. **RAG 知识问答**: ChromaDB 向量检索 + 27 条服装知识库（含 8 篇具体 SKU 参数文档）+ 引用来源展示
+5. **用户认证**: 注册/登录/JWT 令牌/权限校验（admin/user 角色，统一 users 表管理）
+6. **会话管理**: 多轮对话历史存储与恢复 + 删除会话（级联删除消息）
+7. **管理后台**: 三标签界面 — 用户管理（列表查看）/ 订单管理（列表+详情，JOIN 返回用户信息）/ 文档管理（CRUD + 分类管理 + 性别过滤 + 10 条/页分页 + 索引重建）
+8. **压测仪表盘**: 服务端并发压测引擎（httpx），支持逐 token 流式展示，P50/P75/P90/P95/P99 延迟分析
+9. **企业级基础设施**: 结构化日志 + 全局异常 + API 限流 + 请求计时 + 启动时数据库自动迁移（检测旧 schema 自动删库重建）
 
 ---
 

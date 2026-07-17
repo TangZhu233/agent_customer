@@ -47,7 +47,7 @@ model.save('data/models/text2vec-base-chinese')
 ```bash
 python db_init.py
 ```
-生成 `data/customer.db`，包含 7 张表和测试数据（5 用户 + 8 订单 + 5 物流 + 2 认证账号）。
+生成 `data/customer.db`，包含 7 张表和测试数据（6 用户 + 8 订单 + 5 物流）。
 
 ### 5. 启动服务
 ```bash
@@ -77,9 +77,10 @@ uvicorn app.main:app --reload
 | 🧺 洗涤保养 | 棉/羊毛/牛仔/真丝等面料护理指南 |
 | ℹ️ 产品咨询 | 面料特性、新品系列、选购指南 |
 | 📦 订单物流 | 查询用户订单状态和快递进度 |
-| 💬 多轮对话 | 独立会话 + 历史消息持久化 |
+| 💬 多轮对话 | 独立会话 + 历史消息持久化 + 流式逐 token 推送 |
 | 🔐 用户系统 | 注册/登录/修改密码/JWT 认证 |
-| 📚 知识库管理 | 管理员 CRUD + 分类标签过滤 |
+| 📚 知识库管理 | 管理员 CRUD + 分类标签过滤 + 性别过滤 |
+| 📊 压测仪表盘 | 服务端并发压测 + 延迟百分位分析 + 流式实时展示 |
 
 ## API 接口
 
@@ -87,7 +88,7 @@ uvicorn app.main:app --reload
 |------|------|------|------|
 | GET | `/` | 聊天页面（多页面 SPA） | - |
 | GET | `/health` | 健康检查 | - |
-| POST | `/chat` | 对话接口（RAG + 引用） | 可选 |
+| POST | `/chat` | 对话接口（支持 stream=True 流式响应） | 可选 |
 | POST | `/auth/register` | 用户注册 | - |
 | POST | `/auth/login` | 用户登录 → JWT | - |
 | POST | `/auth/change-password` | 修改密码 | 必需 |
@@ -96,6 +97,12 @@ uvicorn app.main:app --reload
 | POST | `/sessions` | 新建会话 | 必需 |
 | GET | `/sessions/{id}/messages` | 会话历史 | 必需 |
 | DELETE | `/sessions/{id}` | 删除会话（级联删除消息） | 必需 |
+| GET | `/benchmark` | 压测仪表盘页面 | - |
+| POST | `/benchmark` | 发起压测（同步返回汇总） | 管理员 |
+| POST | `/benchmark/stream` | 发起压测（流式逐结果推送） | 管理员 |
+| GET | `/admin/users` | 用户列表 | 管理员 |
+| GET | `/admin/orders` | 订单列表 | 管理员 |
+| GET | `/admin/orders/{id}` | 订单详情 | 管理员 |
 | GET | `/admin/kb/documents` | 知识库文档列表 | 管理员 |
 | POST | `/admin/kb/documents` | 添加文档 | 管理员 |
 | PUT | `/admin/kb/documents/{id}` | 更新文档 | 管理员 |
@@ -108,16 +115,17 @@ uvicorn app.main:app --reload
 ```
 agent_customer/
 ├── app/
-│   ├── main.py            # FastAPI 入口 + 17 个 API 端点 + 多页面 HTML
-│   ├── agent.py           # RAG 增强 Agent（系统提示词 + LLM 重试）
+│   ├── main.py            # FastAPI 入口 + 22 个 API 端点 + 多页面 HTML
+│   ├── agent.py           # RAG 增强 Agent（系统提示词 + LLM 重试 + 流式生成器）
 │   ├── tools.py            # 6 个 Agent 工具（含 search_knowledge_base）
-│   ├── models.py           # 20+ Pydantic 模型
+│   ├── models.py           # 25+ Pydantic 模型
 │   ├── database.py         # SQLite 查询封装（7 张表完整 CRUD）
 │   ├── auth.py             # JWT 签发/验证 + bcrypt 密码哈希
 │   ├── rag.py              # ChromaDB 向量存储 + 嵌入 + 检索 + KB 同步 + 索引重建
 │   ├── logger.py           # 结构化日志（api/rag/llm/auth）
 │   ├── middleware.py        # 全局异常捕获 + 请求计时 + 限流
-│   └── kb_seed_data.py     # 19 条服装知识库种子数据
+│   ├── benchmark.py         # 服务端压测引擎（异步并发 + 延迟分位数）
+│   └── kb_seed_data.py     # 27 条服装知识库种子数据 (含 8 篇 SKU)
 ├── config/
 │   └── settings.py          # 配置单例（环境变量 → Python）
 ├── data/

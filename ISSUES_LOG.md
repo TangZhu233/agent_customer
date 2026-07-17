@@ -4,6 +4,86 @@
 
 ---
 
+## 批次 #4 — 2026-07-17（`split('\n')` 遗留换行 → JS 语法错误，登录/注册再次失效）
+
+### 现象
+用户报告注册按钮无法点击，输入用户名密码登录无响应。
+
+### 排查
+1. 后端 API 正常（`/auth/login` → 200, `/auth/register` → 200）
+2. 浏览器端 JS 语法错误会导致**整个 `<script>` 块全部瘫痪**
+3. 用 `node --check` 检查提取的 JS → 报 `Invalid or unexpected token` 定位到 `send()` 函数内 `buffer.split('` 行
+
+### 根因
+`main.py` 的 `CHAT_PAGE` raw string（`r"""..."""`）中，`send()` 函数第 1138-1139 行的 NDJSON 解析代码存在**字面换行符**：
+
+```javascript
+// 错误（Python raw string 中 \n 被写成字面换行）
+const lines = buffer.split('
+');
+// → JS 解析器在 ' 后遇到裸换行 → SyntaxError
+```
+
+这和批次 #3 是同一类问题（Python raw string 中的字面换行混入 JS 字符串），但批次 #3 只修复了 `replace(/\n/g` 和括号问题，**遗漏了这个 `split` 处的字面换行**。
+
+`BENCHMARK_PAGE` 对应位置（第 1937 行）使用了正确的 `'\n'` 转义，不受影响。
+
+### 修复
+`main.py` 第 1138-1139 行：`buffer.split('` + `字面换行` + `');` → `buffer.split('\n');`
+
+Python raw string 中写 `\n` → 输出为两个字面字符 `\` `n` → JS 正确解析为换行转义序列。
+
+### 验证
+- `node --check` 语法检查通过
+- JS 括号 143/143 平衡
+- `/auth/login` API 正常返回 JWT
+- `/auth/register` API 正常注册新用户
+
+
+## 批次 #3 — 2026-07-17（流式对话 JS 注入导致登录失效）
+
+### 现象
+用户报告登录页面无法登录——输入用户名密码点击登录完全没反应。
+
+### 排查
+1. 后端 `/auth/login` API 正常返回 200 + JWT token
+2. 前端页面 `<script>` 块中发现 JS 语法错误：
+   - `}` 比 `{` 少 3 个（143 vs 146）
+   - 浏览器解析到语法错误后，**整个 `<script>` 块全部瘫痪**——不仅是 `handleLogin`，页面所有函数都不可用
+
+### 根因
+流式对话的 JS 辅助函数通过 Python 脚本字符串注入 `main.py` 的 HTML 模板（Python raw string `r"""..."""`）时，产生了 3 个语法错误：
+
+| # | 位置 | 错误 | 原因 |
+|---|------|------|------|
+| 1 | `finalizeStreamingMsg` 内 `replace(/\n/g` | `\n` 被 Python 解析为真实换行，正则裂成两行 | Python 脚本用普通字符串（非 raw），`\n`→换行 |
+| 2 | `hideLoading` 与 streaming helpers 之间 | 旧 `async function send() {` 头残留，`{` 无闭合 | 字符串替换边界裁剪偏差 |
+| 3 | `finalizeStreamingMsg` 结尾 | 函数结束 `}` 丢失 | 替换时末尾一行被截断 |
+
+### 修复
+1. `replace(/\n/g` → `replace(/\\n/g`（Python 层 `\\n`→JS 层 `\n`）
+2. 删除残留的旧 `send()` 头
+3. 补回丢失的 `}` + `scrollTop` 行
+4. 修复 `document.getElementByasync function send()` 拼接错误
+
+### 教训
+- 对 Python raw string 做自动化替换时，**必须 dump 到文件检查**，不能只信任脚本输出
+- JS 语法错误会让整个 `<script>` 块静默失效——排查时第一步就应检查浏览器控制台
+- Python shell 转义 (`python -c`) + raw string 内容 = 灾难，应写独立 `.py` 脚本操作文件
+
+
+## 批次 #2 — 2026-07-17（langgraph 升级导致依赖冲突）
+
+### 现象
+安装 `langgraph` 后，`langchain-core` 从 0.3.x 被升级到 1.4.x，`langchain`、`langchain-deepseek`、`langchain-community`、`langchain-chroma` 全部被卸载。
+
+### 修复
+1. 换清华镜像源 (`pypi.tuna.tsinghua.edu.cn`) 重装所有依赖
+2. `requirements.txt` 版本号更新为 `>=1.0.0`，新增 `langgraph>=1.0.0`
+
+
+---
+
 ## 批次 #1 — 2026-07-16
 
 ### 问题清单

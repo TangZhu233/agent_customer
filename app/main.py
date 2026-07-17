@@ -4,8 +4,8 @@ FastAPI 入口：启动 HTTP 服务，提供完整的服装电商智能客服系
 
 启动命令：uvicorn app.main:app --reload
 """
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
 from app.models import (
     ChatRequest, ChatResponse,
     RegisterRequest, LoginRequest, LoginResponse,
@@ -15,8 +15,10 @@ from app.models import (
     DocumentCreate, DocumentUpdate, DocumentResponse, DocumentListResponse,
     BatchDeleteRequest, Citation,
     AdminUserItem, AdminOrderItem, AdminOrderDetail,
+    BenchmarkRequest, BenchmarkResult,
 )
-from app.agent import chat as agent_chat
+from app.agent import chat as agent_chat, chat_stream as agent_chat_stream
+from app.benchmark import run_benchmark, run_benchmark_stream
 from app.auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, get_optional_user, require_admin,
@@ -322,21 +324,70 @@ async def admin_get_order(order_id: int, user: dict = Depends(require_admin)):
 
 # ==================== 聊天路由 ====================
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat_api(req: ChatRequest, user: dict | None = Depends(get_optional_user)):
     """
     对话接口（向后兼容：未登录也可使用基础功能）。
 
+    支持两种模式：
+    - stream=False（默认）：等待完整回复后返回 JSON
+    - stream=True：SSE 流式响应，逐 token 推送
+
     面试知识点：
-    - Depends(get_optional_user) 实现了"可选认证"模式。
-      与 Depends(get_current_user) 不同，它不抛出 401 而是返回 None，
-      让同一个端点同时支持登录用户（会话持久化 + RAG）和匿名用户（基础查询）。
-    - 这是 FastAPI 依赖注入的一个优雅用法：依赖函数返回 None 在框架中
-      完全合法，路由函数据此切换行为。
+    - 为什么流式响应用 NDJSON（一行一个 JSON）？
+      NDJSON 比 SSE 的 `data:` 前缀更简洁，前端用 ReadableStream + split('\n')
+      即可解析，且与业务数据格式统一（压测也是 NDJSON）。
     """
     user_id = user["user_id"] if user else None
 
-    # 调用 Agent（带 RAG 引用）
+        # --- 流式模式 ---
+    if req.stream:
+        import json as _json
+
+        async def sse_stream():
+            # 先持久化用户消息（异步生成器内无法在外部保存）
+            if user_id and req.session_id:
+                try:
+                    from app.database import save_message, get_session_by_id
+                    session = get_session_by_id(req.session_id)
+                    if session and session["user_id"] == user_id:
+                        save_message(req.session_id, user_id, "user", req.message)
+                except Exception:
+                    pass
+
+            full_reply = ""
+            citations = None
+
+            async for event in agent_chat_stream(
+                message=req.message,
+                user_id=user_id or req.user_id,
+                session_id=req.session_id,
+                enable_rag=req.enable_rag,
+            ):
+                yield _json.dumps(event, ensure_ascii=False) + "\n"
+                if event["type"] == "token":
+                    full_reply += event["content"]
+                elif event["type"] == "done":
+                    citations = event.get("citations")
+
+            # 流结束后持久化 AI 回复
+            if user_id and req.session_id and full_reply:
+                try:
+                    from app.database import save_message, get_session_by_id
+                    session = get_session_by_id(req.session_id)
+                    if session and session["user_id"] == user_id:
+                        citations_json = _json.dumps(citations, ensure_ascii=False) if citations else None
+                        save_message(req.session_id, user_id, "assistant", full_reply, citations_json)
+                except Exception:
+                    pass
+
+        return StreamingResponse(
+            sse_stream(),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+# --- 批处理模式（原有逻辑）---
     reply, citations = await agent_chat(
         message=req.message,
         user_id=user_id or req.user_id,
@@ -346,13 +397,13 @@ async def chat_api(req: ChatRequest, user: dict | None = Depends(get_optional_us
 
     # 持久化消息（仅登录用户 + 有会话时）
     if user_id and req.session_id:
-        import json
+        import json as _json2
         from app.database import save_message, get_session_by_id
 
         session = get_session_by_id(req.session_id)
         if session and session["user_id"] == user_id:
             save_message(req.session_id, user_id, "user", req.message)
-            citations_json = json.dumps(citations, ensure_ascii=False) if citations else None
+            citations_json = _json2.dumps(citations, ensure_ascii=False) if citations else None
             save_message(req.session_id, user_id, "assistant", reply, citations_json)
 
     # 构建响应
@@ -386,6 +437,50 @@ def chat_page():
 def health():
     """健康检查"""
     return {"status": "ok"}
+
+
+# ==================== 压测仪表盘 ====================
+
+@app.get("/benchmark", response_class=HTMLResponse)
+def benchmark_page():
+    """压测仪表盘页面（JS 端检查 token，未登录自动跳回主页）"""
+    return HTMLResponse(content=BENCHMARK_PAGE)
+
+
+@app.post("/admin/benchmark/run", response_model=BenchmarkResult)
+async def benchmark_run(req: BenchmarkRequest, request: Request, user: dict = Depends(require_admin)):
+    """
+    执行压测（批处理模式）：等所有请求完成后一次性返回结果。
+    如需实时推送，使用 /admin/benchmark/stream
+    """
+    base_url = str(request.base_url).rstrip("/")
+    result = await run_benchmark(req.num_users, req.messages, base_url)
+    return BenchmarkResult(**result)
+
+
+@app.post("/admin/benchmark/stream")
+async def benchmark_stream(req: BenchmarkRequest, request: Request, user: dict = Depends(require_admin)):
+    """
+    流式压测：每完成一个请求就推送一条 SSE 事件，前端实时更新图表。
+
+    事件格式（NDJSON，一行一个 JSON）：
+      {"type":"tick","result":{...},"completed":1,"total":10}
+      ...
+      {"type":"summary","total_requests":10,"qps":...,"latency":{...},...}
+    """
+    import json as _json
+
+    base_url = str(request.base_url).rstrip("/")
+
+    async def event_stream():
+        async for event in run_benchmark_stream(req.num_users, req.messages, base_url):
+            yield _json.dumps(event, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 # ==================== 内联 HTML 前端 ====================
@@ -680,6 +775,7 @@ CHAT_PAGE = r"""
         <div class="nav-item active" onclick="adminSwitchTab('users')">👥 用户管理</div>
         <div class="nav-item" onclick="adminSwitchTab('orders')">📦 订单管理</div>
         <div class="nav-item" onclick="adminSwitchTab('docs')">📄 文档管理</div>
+        <div class="nav-item" onclick="window.open('/benchmark')">⚡ 压测仪表盘</div>
         <div class="nav-item" onclick="showPage('chat')">💬 返回聊天</div>
     </aside>
     <main class="admin-main">
@@ -935,6 +1031,63 @@ function showLoading() {
 }
 function hideLoading() { const l = document.getElementById('loader'); if (l) l.remove(); }
 
+// ==================== 流式对话辅助函数 ====================
+// 创建一个空 AI 消息气泡，返回 contentDiv 以便逐 token 追加
+function createStreamingMsg() {
+    const msgs = document.getElementById('msgs');
+    const div = document.createElement('div');
+    div.className = 'msg ai';
+    div.id = 'streaming-msg';
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'msg-content';
+    div.appendChild(contentDiv);
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    return { container: div, contentDiv: contentDiv };
+}
+
+// 移除 streaming 标记并渲染引用
+function finalizeStreamingMsg(fullText, citations) {
+    const el = document.getElementById('streaming-msg');
+    if (!el) return;
+    el.removeAttribute('id');
+
+    const contentDiv = el.querySelector('.msg-content');
+    if (contentDiv) {
+        contentDiv.innerHTML = fullText.replace(/\n/g, '<br>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    }
+
+    if (citations && citations.length > 0) {
+        const citeBlock = document.createElement('div');
+        citeBlock.className = 'cite-block';
+        const toggle = document.createElement('div');
+        toggle.className = 'cite-toggle';
+        toggle.innerHTML = '📚 参考来源 (' + citations.length + ') ▾';
+        toggle.onclick = function() {
+            const list = this.nextElementSibling;
+            const visible = list.style.display !== 'none';
+            list.style.display = visible ? 'none' : '';
+            this.innerHTML = '📚 参考来源 (' + citations.length + ') ' + (visible ? '▾' : '▴');
+        };
+        const list = document.createElement('div');
+        list.className = 'cite-list';
+        list.style.display = 'none';
+        citations.forEach(function(c) {
+            const item = document.createElement('div');
+            item.className = 'cite-item';
+            item.innerHTML = '<span class="cite-cat">' + escHtml(c.category) + '</span>' +
+                '<span class="cite-title">' + escHtml(c.title) + '</span>' +
+                '<div class="cite-snippet">' + escHtml(c.snippet) + '</div>';
+            list.appendChild(item);
+        });
+        citeBlock.appendChild(toggle);
+        citeBlock.appendChild(list);
+        el.appendChild(citeBlock);
+    }
+
+    document.getElementById("msgs").scrollTop = document.getElementById("msgs").scrollHeight;
+}
+
 async function send() {
     const inp = document.getElementById('inp');
     const text = inp.value.trim();
@@ -942,7 +1095,11 @@ async function send() {
     addMsg(text, 'user');
     inp.value = '';
     document.getElementById('btn').disabled = true;
-    showLoading();
+
+    // 创建空气泡准备流式填充
+    const streaming = createStreamingMsg();
+    let fullText = '';
+    let citations = null;
 
     // 自动创建会话
     if (!currentSessionId && USER) {
@@ -951,21 +1108,65 @@ async function send() {
     }
 
     try {
-        const body = { message: text, enable_rag: true };
+        const body = { message: text, enable_rag: true, stream: true };
         if (currentSessionId) body.session_id = currentSessionId;
-        const data = await api('POST', '/chat', body);
-        hideLoading();
-        addMsg(data.reply || '(未收到回复)', 'ai', data.citations);
+
+        const headers = { 'Content-Type': 'application/json' };
+        if (TOKEN) headers['Authorization'] = 'Bearer ' + TOKEN;
+
+        const res = await fetch('/chat', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+            const errData = await res.json().catch(function() { return {}; });
+            throw new Error(errData.detail || '请求失败 (' + res.status + ')');
+        }
+
+        // 流式读取 NDJSON（一行一个 JSON）
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (!line) continue;
+                try {
+                    const event = JSON.parse(line);
+                    if (event.type === 'token') {
+                        fullText += event.content;
+                        streaming.contentDiv.textContent = fullText;
+                        document.getElementById('msgs').scrollTop = document.getElementById('msgs').scrollHeight;
+                    } else if (event.type === 'clear') {
+                        fullText = '';
+                        streaming.contentDiv.textContent = '';
+                    } else if (event.type === 'done') {
+                        citations = event.citations || null;
+                        finalizeStreamingMsg(fullText, citations);
+                    } else if (event.type === 'error') {
+                        streaming.contentDiv.textContent = event.message;
+                    }
+                } catch(e) { console.error('解析流事件失败:', e, line); }
+            }
+        }
     } catch (e) {
-        hideLoading();
-        addMsg('抱歉，请求出错了：' + e.message, 'ai');
+        streaming.contentDiv.textContent = '抱歉，请求出错了：' + e.message;
     }
     document.getElementById('btn').disabled = false;
     inp.focus();
 }
 
 document.getElementById('inp').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-
 // ==================== 会话管理 ====================
 async function loadSessions() {
     if (!TOKEN) return [];
@@ -1317,6 +1518,576 @@ window.onload = function() {
         document.getElementById('login-username').value = USER.username;
     }
 };
+</script>
+</body>
+</html>
+"""
+
+
+# ==================== 压测仪表盘 HTML ====================
+
+BENCHMARK_PAGE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>压测仪表盘 — 智能客服</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js">
+    </script>
+    <style>
+        :root {
+            --primary: #4f6ef7;
+            --primary-light: #6c8cff;
+            --bg: #f0f2f5;
+            --white: #fff;
+            --text: #333;
+            --text-light: #999;
+            --border: #e8e8e8;
+            --danger: #e74c3c;
+            --success: #27ae60;
+            --warning: #f39c12;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Microsoft YaHei", "PingFang SC", "Helvetica Neue", sans-serif;
+            background: var(--bg);
+            min-height: 100vh;
+            color: var(--text);
+        }
+
+        /* ======== 顶部导航 ======== */
+        .topbar {
+            background: var(--white);
+            height: 56px;
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            border-bottom: 1px solid var(--border);
+            gap: 16px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+        }
+        .topbar .logo { font-size: 18px; font-weight: 700; color: var(--primary); }
+        .topbar .sep { flex: 1; }
+        .topbar a {
+            color: var(--primary); text-decoration: none; font-size: 13px;
+            padding: 6px 12px; border-radius: 6px; transition: background .2s;
+        }
+        .topbar a:hover { background: #f0f3ff; }
+
+        /* ======== 主布局 ======== */
+        .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+        /* ======== 控制栏 ======== */
+        .control-bar {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 20px 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+            display: flex;
+            align-items: flex-end;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        .control-group { display: flex; flex-direction: column; gap: 6px; }
+        .control-group label { font-size: 12px; color: var(--text-light); font-weight: 500; }
+        .control-group input, .control-group select {
+            padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+            font-size: 14px; outline: none; font-family: inherit;
+        }
+        .control-group input:focus, .control-group select:focus {
+            border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,110,247,.1);
+        }
+        .slider-row { display: flex; align-items: center; gap: 10px; }
+        .slider-row input[type=range] { width: 160px; accent-color: var(--primary); }
+        .slider-row .val { font-weight: 700; font-size: 16px; min-width: 28px; text-align: center; }
+        .btn-run {
+            padding: 10px 28px; border: none; border-radius: 8px;
+            font-size: 14px; font-weight: 600; cursor: pointer;
+            background: var(--primary); color: #fff; transition: all .2s;
+            height: 40px;
+        }
+        .btn-run:hover:not(:disabled) { background: #3d5ce5; transform: translateY(-1px); }
+        .btn-run:disabled { background: #bbb; cursor: not-allowed; }
+        .btn-run.running { background: var(--danger); animation: pulse 1.2s infinite; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        /* ======== 进度信息 ======== */
+        .progress-info {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 12px 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+            display: none;
+            align-items: center;
+            gap: 12px;
+            font-size: 13px;
+            color: var(--text-light);
+        }
+        .progress-info.show { display: flex; }
+        .spinner {
+            width: 20px; height: 20px;
+            border: 3px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin .6s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ======== 统计卡片 ======== */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+        }
+        .stat-card .value {
+            font-size: 32px; font-weight: 700; color: var(--primary);
+            margin-bottom: 4px;
+        }
+        .stat-card .value.danger { color: var(--danger); }
+        .stat-card .value.success { color: var(--success); }
+        .stat-card .label { font-size: 12px; color: var(--text-light); }
+
+        /* ======== 图表区 ======== */
+        .charts-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .chart-card {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+        }
+        .chart-card h3 {
+            font-size: 15px; margin-bottom: 16px; color: var(--text);
+            font-weight: 600;
+        }
+        .chart-card canvas { max-height: 320px; }
+
+        /* ======== 错误列表 ======== */
+        .error-list {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 20px 24px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+            display: none;
+        }
+        .error-list.show { display: block; }
+        .error-list h3 { font-size: 15px; margin-bottom: 12px; color: var(--danger); font-weight: 600; }
+        .error-list .err-item {
+            font-size: 12px; color: var(--danger); padding: 6px 0;
+            border-bottom: 1px solid var(--border); font-family: "Consolas", monospace;
+        }
+
+        /* ======== 指标说明 ======== */
+        .help-section {
+            background: var(--white);
+            border-radius: 12px;
+            padding: 20px 24px;
+            margin-top: 20px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.04);
+        }
+        .help-section h3 { font-size: 15px; margin-bottom: 12px; }
+        .help-section table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .help-section th, .help-section td {
+            text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border);
+        }
+        .help-section th { color: var(--primary); font-weight: 600; }
+
+        /* ======== Toast ======== */
+        .toast {
+            position: fixed; top: 20px; right: 20px; z-index: 9999;
+            padding: 12px 20px; border-radius: 8px; color: #fff; font-size: 13px;
+            opacity: 0; transform: translateY(-10px); transition: all .3s;
+            pointer-events: none;
+        }
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast-error { background: var(--danger); }
+        .toast-success { background: var(--success); }
+
+        @media (max-width: 768px) {
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+            .charts-row { grid-template-columns: 1fr; }
+            .control-bar { flex-direction: column; align-items: stretch; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="topbar">
+    <span class="logo">⚡ 压测仪表盘</span>
+    <span style="font-size:12px;color:var(--text-light)">模拟多用户并发访问客服系统</span>
+    <span class="sep"></span>
+    <a href="/">💬 返回客服</a>
+    <a href="/admin">⚙️ 后台管理</a>
+</div>
+
+<div class="container">
+    <!-- 控制栏 -->
+    <div class="control-bar">
+        <div class="control-group">
+            <label>并发用户数</label>
+            <div class="slider-row">
+                <input type="range" id="num-users" min="1" max="100" value="10" oninput="onSliderChange()">
+                <span class="val" id="num-users-val">10</span>
+            </div>
+        </div>
+        <div class="control-group" style="flex:1;min-width:240px;">
+            <label>提问内容（一行一个，压测时轮询分配）</label>
+            <textarea id="messages" rows="3" style="font-size:13px;">我想买一件适合夏天穿的连衣裙，有什么推荐吗？
+我身高170cm体重65kg，应该穿什么尺码？
+我的订单号是ORD20240715001，帮我查一下物流
+纯棉T恤怎么洗不会缩水？
+这件衣服支持退换货吗？</textarea>
+        </div>
+        <button class="btn-run" id="btn-run" onclick="startBenchmark()">🚀 开始压测</button>
+    </div>
+
+    <!-- 进度条 -->
+    <div class="progress-info" id="progress-info">
+        <div class="spinner"></div>
+        <span id="progress-text">压测进行中...</span>
+    </div>
+
+    <!-- 统计卡片 -->
+    <div class="stats-row" id="stats-row" style="display:none;">
+        <div class="stat-card">
+            <div class="value" id="stat-qps">--</div>
+            <div class="label">QPS（每秒处理请求数）</div>
+        </div>
+        <div class="stat-card">
+            <div class="value" id="stat-avg">--</div>
+            <div class="label">平均延迟 (ms)</div>
+        </div>
+        <div class="stat-card">
+            <div class="value success" id="stat-rate">--</div>
+            <div class="label">成功率</div>
+        </div>
+        <div class="stat-card">
+            <div class="value" id="stat-total">--</div>
+            <div class="label">总耗时 (秒)</div>
+        </div>
+    </div>
+
+    <!-- 图表区 -->
+    <div class="charts-row" id="charts-row" style="display:none;">
+        <div class="chart-card">
+            <h3>📊 延迟分位数 (ms) — 越低越好</h3>
+            <canvas id="chart-percentile"></canvas>
+        </div>
+        <div class="chart-card">
+            <h3>📍 逐请求延迟分布 — 看是否越压越慢</h3>
+            <canvas id="chart-scatter"></canvas>
+        </div>
+    </div>
+
+    <!-- 错误列表 -->
+    <div class="error-list" id="error-list">
+        <h3>⚠️ 失败请求详情</h3>
+        <div id="error-items"></div>
+    </div>
+
+    <!-- 指标说明 -->
+    <div class="help-section">
+        <h3>📖 指标怎么看？</h3>
+        <table>
+            <tr><th>指标</th><th>含义</th><th>怎么判断好坏</th></tr>
+            <tr><td>QPS</td><td>每秒能处理多少请求</td><td>越高越好。客服系统通常 5-50 QPS 即可用</td></tr>
+            <tr><td>P50 延迟</td><td>一半用户在此时间内得到回复</td><td>用户体感的"快慢"，2 秒内较好</td></tr>
+            <tr><td>P95 延迟</td><td>最慢的 5% 用户等了多久</td><td>长尾指标，超过 10 秒说明有毛刺</td></tr>
+            <tr><td>P99 延迟</td><td>最慢的 1% 用户等了多久</td><td>定位极端情况，能否接受取决于业务</td></tr>
+            <tr><td>成功率</td><td>返回 200 的请求占比</td><td>必须 100%，低于 95% 需要排查</td></tr>
+            <tr><td>散点图趋势</td><td>请求按时间排列的延迟变化</td><td>如果散点越来越高 → 系统在累积压力</td></tr>
+        </table>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ==================== 状态 ====================
+let charts = { percentile: null, scatter: null };
+let running = false;
+let liveResults = [];  // 实时累积的请求结果
+
+// ==================== 鉴权 ====================
+function getToken() {
+    return localStorage.getItem('access_token') || '';
+}
+
+// 未登录则跳回主页登录
+if (!getToken()) {
+    window.location.href = '/';
+}
+
+// ==================== 工具函数 ====================
+function $(id) { return document.getElementById(id); }
+
+function onSliderChange() {
+    $('num-users-val').textContent = $('num-users').value;
+}
+
+function showToast(msg, type) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.className = 'toast toast-' + type + ' show';
+    setTimeout(() => { t.className = 'toast'; }, 3000);
+}
+
+function escHtml(s) {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+}
+
+// ==================== 百分位计算 ====================
+function percentile(sorted, p) {
+    if (!sorted.length) return 0;
+    var k = (sorted.length - 1) * p / 100;
+    var f = Math.floor(k), c = k - f;
+    if (f + 1 < sorted.length) return sorted[f] * (1 - c) + sorted[f + 1] * c;
+    return sorted[f];
+}
+
+// ==================== 实时统计 ====================
+function computeLiveStats() {
+    var success = liveResults.filter(function(r) { return r.status_code === 200; });
+    var lats = success.map(function(r) { return r.elapsed_ms; }).sort(function(a, b) { return a - b; });
+    return {
+        completed: liveResults.length,
+        success: success.length,
+        errors: liveResults.length - success.length,
+        avg: lats.length ? Math.round(lats.reduce(function(a, b) { return a + b; }, 0) / lats.length) : 0,
+        p50: percentile(lats, 50),
+        p75: percentile(lats, 75),
+        p90: percentile(lats, 90),
+        p95: percentile(lats, 95),
+        p99: percentile(lats, 99),
+        lats: lats,
+    };
+}
+
+// ==================== 压测执行 ====================
+async function startBenchmark() {
+    if (running) return;
+    running = true;
+    liveResults = [];
+
+    var btn = $('btn-run');
+    btn.textContent = '⏳ 压测中...';
+    btn.classList.add('running');
+    btn.disabled = true;
+
+    var numUsers = parseInt($('num-users').value);
+    var rawMessages = $('messages').value.split('\n').filter(function(m) { return m.trim(); });
+    if (rawMessages.length === 0) { showToast('请至少输入一条提问内容', 'error'); resetButton(); return; }
+
+    // 显示进度
+    $('progress-info').classList.add('show');
+    $('progress-text').textContent = '0 / ' + numUsers + ' 已完成...';
+    $('stats-row').style.display = '';
+    $('charts-row').style.display = '';
+    $('error-list').classList.remove('show');
+    // 初始空图表
+    renderPercentileChart({p50_ms:0,p75_ms:0,p90_ms:0,p95_ms:0,p99_ms:0});
+    renderScatterChart([]);
+
+    try {
+        var res = await fetch('/admin/benchmark/stream', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + getToken(),
+            },
+            body: JSON.stringify({ num_users: numUsers, messages: rawMessages }),
+        });
+
+        if (!res.ok) {
+            var err = await res.json().catch(function() { return {}; });
+            throw new Error(err.detail || '请求失败 (' + res.status + ')');
+        }
+
+        // 流式读取 NDJSON（一行一个 JSON 事件）
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buffer += decoder.decode(chunk.value, { stream: true });
+
+            var lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i].trim();
+                if (!line) continue;
+                try {
+                    var event = JSON.parse(line);
+                    if (event.type === 'tick') {
+                        liveResults.push(event.result);
+                        updateLiveStats(event.completed, event.total);
+                    } else if (event.type === 'summary') {
+                        renderFinalResults(event);
+                    }
+                } catch(e) { console.error('解析事件失败:', e, line); }
+            }
+        }
+    } catch (e) {
+        $('progress-info').classList.remove('show');
+        showToast('压测失败: ' + e.message, 'error');
+    }
+
+    resetButton();
+}
+
+// ==================== 实时更新 ====================
+function updateLiveStats(completed, total) {
+    var stats = computeLiveStats();
+    $('stat-qps').textContent = '...';
+    $('stat-avg').textContent = stats.avg;
+    $('stat-rate').textContent = (completed > 0 ? (stats.success / completed * 100).toFixed(1) : '0') + '%';
+    $('stat-total').textContent = '...';
+    $('progress-text').textContent = completed + ' / ' + total + ' 已完成  |  当前平均 ' + stats.avg + 'ms';
+
+    renderPercentileChart(stats);
+    renderScatterChart(liveResults);
+}
+
+function renderFinalResults(data) {
+    $('progress-text').textContent = '压测完成！' + data.total_requests + ' 请求，耗时 ' + (data.total_duration_ms / 1000).toFixed(1) + ' 秒';
+    setTimeout(function() { $('progress-info').classList.remove('show'); }, 4000);
+
+    $('stat-qps').textContent = data.qps;
+    $('stat-avg').textContent = data.latency.avg_ms;
+    $('stat-rate').textContent = data.total_requests > 0
+        ? (data.success_count / data.total_requests * 100).toFixed(1) + '%'
+        : '--';
+    if (data.error_count > 0) {
+        $('stat-rate').classList.add('danger');
+    } else {
+        $('stat-rate').classList.remove('danger');
+    }
+    $('stat-total').textContent = (data.total_duration_ms / 1000).toFixed(1);
+
+    renderPercentileChart(data.latency);
+    renderScatterChart(data.per_request);
+
+    if (data.errors && data.errors.length > 0) {
+        $('error-items').innerHTML = data.errors.map(function(e) { return '<div class="err-item">' + escHtml(e) + '</div>'; }).join('');
+        $('error-list').classList.add('show');
+    } else {
+        $('error-list').classList.remove('show');
+    }
+
+    showToast('压测完成！' + data.success_count + ' 成功, QPS=' + data.qps, 'success');
+}
+
+function resetButton() {
+    running = false;
+    var btn = $('btn-run');
+    btn.textContent = '🚀 开始压测';
+    btn.classList.remove('running');
+    btn.disabled = false;
+}
+
+// ==================== 图表渲染 ====================
+function renderPercentileChart(lat) {
+    var ctx = $('chart-percentile').getContext('2d');
+    if (charts.percentile) charts.percentile.destroy();
+
+    var labels = ['P50', 'P75', 'P90', 'P95', 'P99'];
+    var values = [lat.p50_ms, lat.p75_ms, lat.p90_ms, lat.p95_ms, lat.p99_ms];
+    var colors = values.map(function(v) {
+        if (!v) return 'rgba(200,200,200,0.7)';
+        if (v < 2000) return 'rgba(39,174,96,0.7)';
+        if (v < 5000) return 'rgba(243,156,18,0.7)';
+        return 'rgba(231,76,60,0.7)';
+    });
+
+    charts.percentile = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [{
+                label: '延迟 (ms)',
+                data: values,
+                backgroundColor: colors,
+                borderRadius: 6,
+            }],
+        },
+        options: {
+            responsive: true,
+            animation: { duration: 200 },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) { return ctx.raw + ' ms' + (ctx.raw >= 5000 ? ' ⚠️ 偏慢' : ctx.raw >= 2000 ? ' 一般' : ''); },
+                    },
+                },
+            },
+            scales: {
+                y: { beginAtZero: true, title: { display: true, text: '毫秒 (ms)' } },
+            },
+        },
+    });
+}
+
+function renderScatterChart(requests) {
+    var ctx = $('chart-scatter').getContext('2d');
+    if (charts.scatter) charts.scatter.destroy();
+
+    var points = requests
+        .filter(function(r) { return r.status_code === 200; })
+        .map(function(r, i) { return { x: i + 1, y: r.elapsed_ms }; });
+
+    charts.scatter = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+            datasets: [{
+                label: '成功请求',
+                data: points,
+                backgroundColor: 'rgba(79,110,247,0.5)',
+                borderColor: 'rgba(79,110,247,0.8)',
+                pointRadius: 4,
+                pointHoverRadius: 7,
+            }],
+        },
+        options: {
+            responsive: true,
+            animation: { duration: 150 },
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) { return '请求 #' + ctx.raw.x + ': ' + ctx.raw.y + ' ms'; },
+                    },
+                },
+            },
+            scales: {
+                x: { title: { display: true, text: '请求序号（按完成顺序）' } },
+                y: { beginAtZero: true, title: { display: true, text: '延迟 (ms)' } },
+            },
+        },
+    });
+}
 </script>
 </body>
 </html>

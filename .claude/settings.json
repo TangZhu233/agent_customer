@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from langgraph.prebuilt import create_react_agent; print\\('OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(nohup bash -c \"conda activate agent_customer && uvicorn app.main:app --host 0.0.0.0 --port 8000\")",
+      "Bash(echo \"Server PID: $!\")",
+      "Read(//tmp/**)"
+    ]
+  }
+}

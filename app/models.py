@@ -12,6 +12,7 @@ class ChatRequest(BaseModel):
     user_id: int | None = None           # 可选，已登录用户传自己的ID（向后兼容）
     session_id: int | None = None        # 新增：会话ID，用于多轮对话
     enable_rag: bool = True              # 新增：是否启用知识库检索
+    stream: bool = False                 # 新增：是否使用流式响应（逐 token 推送）
 
 
 class Citation(BaseModel):
@@ -170,3 +171,35 @@ class AdminOrderDetail(BaseModel):
     created_at: str
     username: str
     phone: str | None = None
+
+
+# ==================== 压测 ====================
+
+class BenchmarkRequest(BaseModel):
+    """发起压测请求"""
+    num_users: int = Field(default=10, ge=1, le=100, description="并发用户数")
+    messages: list[str] = Field(..., min_length=1, description="提问内容列表（不足时循环使用）")
+
+
+class LatencyStats(BaseModel):
+    """延迟分位数统计"""
+    min_ms: float
+    max_ms: float
+    avg_ms: float
+    p50_ms: float
+    p75_ms: float
+    p90_ms: float
+    p95_ms: float
+    p99_ms: float
+
+
+class BenchmarkResult(BaseModel):
+    """压测结果汇总"""
+    total_requests: int
+    success_count: int
+    error_count: int
+    qps: float
+    total_duration_ms: float
+    latency: LatencyStats
+    errors: list[str]
+    per_request: list[dict]

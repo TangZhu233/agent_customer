@@ -132,6 +132,24 @@ async def _invoke_agent(agent, messages: list) -> dict:
 
 # ==================== 公开接口 ====================
 
+async def _build_messages(message: str, user_id: int | None, session_id: int | None) -> list:
+    """构建发送给 Agent 的消息列表（供 chat 和 chat_stream 共用）"""
+    messages = [("system", SYSTEM_PROMPT)]
+
+    if user_id is not None and session_id is not None:
+        try:
+            from app.database import get_session_messages
+            history = get_session_messages(session_id, user_id)
+            for msg in history[-20:]:
+                role = "assistant" if msg["role"] == "assistant" else "user"
+                messages.append((role, msg["content"]))
+        except Exception:
+            pass
+
+    messages.append(("user", message))
+    return messages
+
+
 async def chat(
     message: str,
     user_id: int | None = None,
@@ -152,30 +170,14 @@ async def chat(
       关注点分离：agent.py 是业务逻辑层，不应依赖 models.py（Web 层）。
       返回原始 tuple 让 main.py 负责封装成 ChatResponse，符合分层架构原则。
     """
-    import time
-
     # 1. 清空上次请求的引用缓存（ContextVar 隔离）
     clear_citations()
 
     # 1.5. 设置当前用户上下文（供工具函数隐私校验使用）
     set_current_user(user_id)
 
-    # 2. 构建消息列表
-    messages = [("system", SYSTEM_PROMPT)]
-
-    # 3. 加载会话历史（最多最近 10 轮）
-    if user_id is not None and session_id is not None:
-        try:
-            from app.database import get_session_messages
-            history = get_session_messages(session_id, user_id)
-            for msg in history[-20:]:  # 最近 20 条 = 10 轮对话
-                role = "assistant" if msg["role"] == "assistant" else "user"
-                messages.append((role, msg["content"]))
-        except Exception:
-            pass  # 历史加载失败不影响本次对话
-
-    # 4. 当前用户消息
-    messages.append(("user", message))
+    # 2-4. 构建消息列表
+    messages = await _build_messages(message, user_id, session_id)
 
     # 5. 获取 Agent 并调用
     agent = get_agent(enable_rag=enable_rag)
@@ -201,3 +203,77 @@ async def chat(
     citations_out = citations if citations else None
 
     return reply, citations_out
+
+
+async def chat_stream(
+    message: str,
+    user_id: int | None = None,
+    session_id: int | None = None,
+    enable_rag: bool = True,
+):
+    """
+    流式对话：逐 token 推送 LLM 输出，用户感知延迟从 9 秒降到 1 秒。
+
+    面试知识点：
+    - 为什么使用 astream_events 而不是 ainvoke？
+      ainvoke 等 LLM 全部生成完才返回（用户干等 9 秒）。
+      astream_events 每生成一个 token 就 push 一次（用户 1 秒后开始阅读）。
+
+    - ReAct Agent 至少 2 次 LLM 调用（思考→工具→回答），如何处理？
+      只流式推送「最后一次」LLM 调用的 token（最终回答），
+      跳过的第一次是工具调用 JSON（用户不需要看到内部推理过程）。
+
+    - 检测"最后一次"的方法：按 run_id 分组，新 run_id 出现时 discard 旧内容，
+      始终只推送最新 run_id 的 token。
+    """
+    import time
+
+    # 1. 清空 ContextVar
+    clear_citations()
+    set_current_user(user_id)
+
+    # 2-4. 构建消息
+    messages = await _build_messages(message, user_id, session_id)
+    agent = get_agent(enable_rag=enable_rag)
+
+    # 流式状态追踪
+    run_contents = {}   # run_id → 累积文本
+    run_order = []      # LLM 调用顺序
+
+    try:
+        async for event in agent.astream_events({"messages": messages}, version="v2"):
+            if event["event"] != "on_chat_model_stream":
+                continue
+
+            chunk = event["data"]["chunk"]
+            content = chunk.content
+            if not content:
+                continue
+
+            run_id = event.get("run_id", "unknown")
+
+            # 新 LLM 调用开始 → 清空前端之前显示的中间推理
+            if run_id not in run_contents:
+                run_contents[run_id] = ""
+                run_order.append(run_id)
+                if len(run_order) > 1:
+                    yield {"type": "clear"}
+
+            run_contents[run_id] += content
+
+            # 只推送「最新一次」LLM 调用的 token（最终回答）
+            if run_id == run_order[-1]:
+                yield {"type": "token", "content": content}
+
+    except RetryError:
+        yield {"type": "error", "message": "AI 服务暂时不可用，请稍后重试。"}
+        return
+    except Exception as e:
+        llm_log.error("流式调用异常: %s", e)
+        yield {"type": "error", "message": f"处理请求出错: {str(e)[:100]}"}
+        return
+
+    # 收集引用
+    citations = get_citations()
+    citations_out = citations if citations else None
+    yield {"type": "done", "citations": citations_out}
