@@ -18,7 +18,14 @@ Agent 启动时初始化一次，后续所有请求共用同一个实例。
   如果使用全局变量，请求 A 可能读到请求 B 存入的引用数据（数据串扰）。
   ContextVar 是 Python 标准库为 async/await 设计的协程安全存储，每个
   协程任务有独立副本。类比：全局变量=公共白板，ContextVar=每人一张便签纸。
+
+- 熔断器为什么包裹 tenacity 重试链而不是替代它？
+  重试和熔断解决不同层次的问题：tenacity 处理偶发网络抖动（2s/4s/8s 指数退避），
+  熔断器处理持续性故障（连续 5 次 RetryError → 快速失败 30 秒）。
+  关键是：tenacity 的 RetryError（3 次全失败）才算熔断器的 1 次失败，
+  避免单次网络抖动触发熔断。
 """
+import asyncio
 import contextvars
 from langchain_deepseek import ChatDeepSeek
 from langgraph.prebuilt import create_react_agent
@@ -214,22 +221,59 @@ async def chat(
     # 1.5. 设置当前用户上下文（供工具函数隐私校验使用）
     set_current_user(user_id)
 
-    # 2-4. 构建消息列表
+    # 2. 构建消息列表
     messages = await _build_messages(message, user_id, session_id)
 
-    # 5. 获取 Agent 并调用
+    # 3. 熔断器检查（在 LLM 调用前）
+    if settings.CB_ENABLED:
+        from app.circuit_breaker import get_circuit_breaker
+        cb = get_circuit_breaker()
+        if not await cb.allow_request():
+            llm_log.warning("熔断器已断开，快速失败")
+            return (
+                "抱歉，AI 服务暂时不可用（已触发熔断保护），请稍后重试或联系人工客服。",
+                None,
+            )
+
+    # 4. 获取 Agent
     agent = get_agent(enable_rag=enable_rag)
 
+    # 5. LLM 调用（含超时 + 熔断记录）
     try:
-        result = await _invoke_agent(agent, messages)
+        if settings.LLM_REQUEST_TIMEOUT > 0:
+            result = await asyncio.wait_for(
+                _invoke_agent(agent, messages),
+                timeout=settings.LLM_REQUEST_TIMEOUT,
+            )
+        else:
+            result = await _invoke_agent(agent, messages)
+
+        # 成功 → 通知熔断器
+        if settings.CB_ENABLED:
+            await cb.record_success()
+
+    except asyncio.TimeoutError:
+        llm_log.error("LLM 调用超时 (%.1fs)", settings.LLM_REQUEST_TIMEOUT)
+        if settings.CB_ENABLED:
+            await cb.record_failure()
+        return "抱歉，AI 服务响应超时，请简化问题后重试。", None
+
     except GraphRecursionError:
         llm_log.warning("Agent 递归超限，强制终止（recursion_limit=%d）", 10)
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         return "抱歉，处理您的请求时步骤过多，请简化问题后重试。", None
+
     except RetryError as e:
         llm_log.error("LLM 调用全部重试失败: %s", e)
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         return "抱歉，AI 服务暂时不可用，请稍后重试。如急需帮助请联系人工客服。", None
+
     except Exception as e:
         llm_log.error("Agent 调用异常: %s", e)
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         return "抱歉，处理您的请求时出现了问题，请稍后重试。", None
 
     # 6. 提取 AI 回复
@@ -273,8 +317,17 @@ async def chat_stream(
     clear_citations()
     set_current_user(user_id)
 
-    # 2-4. 构建消息
+    # 2. 构建消息
     messages = await _build_messages(message, user_id, session_id)
+
+    # 3. 熔断器检查
+    if settings.CB_ENABLED:
+        from app.circuit_breaker import get_circuit_breaker
+        cb = get_circuit_breaker()
+        if not await cb.allow_request():
+            llm_log.warning("熔断器已断开（流式），快速失败")
+            yield {"type": "error", "message": "AI 服务暂时不可用（已触发熔断保护），请稍后重试。"}
+            return
     agent = get_agent(enable_rag=enable_rag)
 
     # 流式状态追踪
@@ -282,6 +335,7 @@ async def chat_stream(
     run_order = []      # LLM 调用顺序
 
     stream_start = time.perf_counter()
+    stream_success = False
 
     try:
         async for event in agent.astream_events(
@@ -312,17 +366,30 @@ async def chat_stream(
             if run_id == run_order[-1]:
                 yield {"type": "token", "content": content}
 
+        stream_success = True
+
     except GraphRecursionError:
         llm_log.warning("Agent 递归超限（流式），强制终止")
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         yield {"type": "error", "message": "处理步骤过多，请简化问题后重试。"}
         return
     except RetryError:
+        llm_log.error("流式 LLM 调用全部重试失败")
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         yield {"type": "error", "message": "AI 服务暂时不可用，请稍后重试。"}
         return
     except Exception as e:
         llm_log.error("流式调用异常: %s", e)
+        if settings.CB_ENABLED:
+            await cb.record_failure()
         yield {"type": "error", "message": f"处理请求出错: {str(e)[:100]}"}
         return
+
+    # 成功 → 通知熔断器
+    if stream_success and settings.CB_ENABLED:
+        await cb.record_success()
 
     # 收集引用
     citations = get_citations()

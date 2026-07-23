@@ -7,14 +7,81 @@
 
 ## 当前状态
 
-- **版本**: v0.3.3
-- **最后更新**: 2026-07-21
+- **版本**: v0.4.1
+- **最后更新**: 2026-07-23
 - **进行中**: 无
 - **待办**: 见下方「待办事项」
 
 ---
 
 ## 进度时间线
+
+### [2026-07-23] 修复 + 文档: Redis 缓存跨用户泄露修复 + 架构决策文档化
+
+- **类型**: Bug 修复 + 文档
+- **问题**:
+  1. v0.4.0 的 Redis 缓存在 Agent 层缓存 LLM 最终回复，用户 A 的多轮对话上下文（含 "SKU-2026-001 未找到"）被缓存后，用户 B 单独问同一问题时收到了 A 的上下文回复——跨用户信息泄露
+  2. RAG 缓存"没反应"——Agent 层加 `has_history` 守卫后，会话场景下缓存永远跳过（第一条消息后 history 永不为空）
+- **概述**:
+  - **缓存搬家（Agent 层 → RAG 检索层）**: 删除 `app/agent.py` 中 `chat()` 和 `chat_stream()` 的全部缓存逻辑（~30行），改为在 `app/rag.py` 的 `search_similar()` 中做缓存——RAG 检索是确定性纯函数，同样参数永远返回同样文档列表，与用户身份和对话历史无关
+  - **缓存键增强**: `_normalize_query()` 去空白+中文标点+小写化，消除 LLM 措辞变体；`_cache_key()` 包含 retrieval_mode，区分 dense/hybrid；tools.py 中 gender/category 的 "通用" 加入 strip list
+  - **三个关键认知**:
+    1. 缓存 RAG 结果而非 LLM 回复——RAG 是纯函数，LLM 回复依赖上下文
+    2. 缓存在此的首要价值是"一致性"（所有人基于同一知识源）和"去重"（同一查询只检索一次），速度只是副作用
+    3. 缓存永远是旁路——所有 Redis 操作 try/except 包裹，挂了不影响服务
+  - **架构决策文档化**: README.md 新增「架构决策」章节（多路召回 / 语义缓存 / 重排序取舍 / 熔断器设计），PROJECT_SUMMARY.md 新增 ADR 章节，INTERVIEW_PREP.md 更新至 v0.4.1
+- **修改文件**:
+  - `app/cache.py` — 完全重写：LLM 回复缓存 → RAG 检索缓存，含 query 归一化
+  - `app/rag.py` — `search_similar()` 加 3 步缓存层（查缓存→检索→写缓存 fire-and-forget）
+  - `app/agent.py` — 删除 `chat()` 和 `chat_stream()` 中全部缓存逻辑
+  - `app/tools.py` — "通用" 加入 gender/category strip list，防止 LLM 参数不一致导致不同缓存键
+  - `README.md` — 全面重写：新增「架构决策」章节（5 个 ADR）
+  - `PROJECT_SUMMARY.md` — 新增 ADR 章节 + 技术栈补充 + 约束补充
+  - `INTERVIEW_PREP.md` — 更新至 v0.4.1
+- **方案**: 缓存下沉到确定性层（RAG 检索），Agent 层只负责调用工具和推理。缓存键标准化（query 归一化 + 参数归一化）
+- **验证**:
+  - 同一 query 两次检索，第二次日志显示 `RAG 缓存命中: rag:cache:...`
+  - 跨用户安全：A 和 B 问相同问题，RAG 缓存共享正确，回复各自独立
+  - 对话历史不影响：多轮中每轮 RAG 检索独立缓存
+  - KB 更新后缓存自动失效（`_invalidate_caches_and_reindex` pattern 已覆盖 `rag:cache:*`）
+
+
+### [2026-07-22] 功能开发: RAG 检索升级三件套——多路召回 + 熔断器 + Redis 缓存
+
+- **类型**: 功能开发 + 基础设施
+- **概述**:
+  - **多路召回 + 重排序**: 稠密向量(ChromaDB) + 稀疏关键词(BM25/jieba) → RRF 融合 → 可选 LLM 重排序，`RETRIEVAL_MODE=hybrid` 启用
+  - **熔断器**: 三态状态机(CLOSED→OPEN→HALF_OPEN)，包裹 tenacity 重试链，连续失败 5 次后快速失败 30s
+  - **Redis 语义缓存**: 基于问题文本 MD5 的精确匹配缓存，命中 <10ms，跨用户跨会话全局共享，含流式支持
+- **新增文件**:
+  - `app/retrieval.py` — HybridRetriever (342行): BM25Retriever + RRF + LLM Rerank
+  - `app/circuit_breaker.py` — CircuitBreaker (193行): 三态状态机 + asyncio.wait_for 超时
+  - `app/cache.py` — RedisCache (191行): 连接池 + get/set/invalidate + 优雅降级 (Redis 5.x 需 protocol=2)
+- **修改文件**:
+  - `app/agent.py` — 熔断器 + Redis 缓存注入 chat() 和 chat_stream() + asyncio.wait_for 超时
+  - `app/tools.py` — search_knowledge_base/recommend_size 改为 async
+  - `app/rag.py` — search_similar → _dense_search 重命名 + hybrid 路由 + rebuild_bm25_index()
+  - `app/main.py` — startup/shutdown 钩子(Redis + BM25索引) + KB CRUD 后缓存失效
+  - `config/settings.py` — 新增 15+ 配置项 (CB/REDIS/RETRIEVAL 三组)
+  - `.env.example` + `.env` — 补全所有配置段
+  - `requirements.txt` — 新增 jieba, rank-bm25, redis
+- **配置开关**:
+  - `RETRIEVAL_MODE=dense|hybrid` (默认 dense 向后兼容)
+  - `CB_ENABLED=true` (默认开)
+  - `REDIS_ENABLED=true|false` (默认 false，需 Redis 服务)
+  - `RERANK_ENABLED=false` (可选 LLM 重排序)
+- **验证**:
+  - 非流式 + RAG 对话正常（5条引用）
+  - 流式对话正常（100 tokens, 1.9s）
+  - Redis 缓存命中 <10ms（加速 99.99%），跨用户跨会话共享
+  - 熔断器状态转换日志确认
+  - 多路召回 hybrid 模式 BM25 索引构建成功
+- **踩坑**:
+  - ① agent_customer conda 环境需手动装新依赖（pip install 默认装到了 base 环境）
+  - ② Redis 5.0.14.1 Windows 版不支持 RESP3 协议 → 连接池和客户端均需 `protocol=2`
+  - ③ 流式 chat_stream() 最初没加缓存，前端默认流式导致缓存形同虚设 → 后补上
+  - ④ cb.record_success() 漏写 await → RuntimeWarning → 补上
+  - ⑤ 知识库中 SKU 格式为 `T-SU-WH-L` 等，非 `SKU-2026-001`
 
 ### [2026-07-14 10:22] 项目初始化
 - **类型**: 功能开发
@@ -345,7 +412,9 @@
 | P2 | Prompt Caching（DeepSeek API 侧缓存系统提示词） | 待开发 |
 | P2 | 增加"退换货处理"工具 | 待开发 |
 | P2 | ~~用户认证（登录后只能查自己订单）~~ | 已完成（JWT + bcrypt） |
-| P3 | 语义缓存（向量相似度匹配历史问答） | 待规划 |
+| P3 | ~~语义缓存~~ | 已完成（RAG 检索层缓存，v0.4.1） |
+| P3 | ~~多路召回 (BM25 混合检索)~~ | 已完成（v0.4.0） |
+| P3 | ~~LLM 熔断机制~~ | 已完成（v0.4.0） |
 | P3 | 部署到服务器/云平台 | 待规划 |
 | P3 | 对接企业微信/飞书等 IM | 待规划 |
 

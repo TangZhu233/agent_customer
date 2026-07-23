@@ -130,7 +130,7 @@ def delete_document(doc_id: int) -> None:
 
 # ==================== 检索操作 ====================
 
-def search_similar(query: str, k: int | None = None, category: str | None = None, gender: str | None = None) -> list[dict]:
+def _dense_search(query: str, k: int | None = None, category: str | None = None, gender: str | None = None) -> list[dict]:
     """
     向量相似检索。
 
@@ -222,6 +222,77 @@ def search_similar(query: str, k: int | None = None, category: str | None = None
         query[:50], category or "全部", gender or "全部", k, len(docs), elapsed,
     )
     return docs
+
+
+async def search_similar(query: str, k: int | None = None, category: str | None = None, gender: str | None = None) -> list[dict]:
+    """
+    向量相似检索（统一入口）。
+
+    根据 RETRIEVAL_MODE 配置自动路由：
+    - dense: 原始单路稠密检索（ChromaDB only，向后兼容）
+    - hybrid: 多路召回 + RRF 融合 + 可选 LLM 重排序
+
+    参数和返回值格式与 _dense_search 保持一致。
+
+    缓存策略：RAG 检索结果是确定性函数（同样的检索参数 → 同样的文档列表），
+    与用户身份、对话上下文无关，因此在此层做 Redis 缓存是正确的。
+    KB 更新时通过 _invalidate_caches_and_reindex 批量失效。
+    """
+    import asyncio
+    from config.settings import settings
+
+    k = k or settings.VECTOR_SEARCH_K
+
+    # 1. 查缓存
+    if settings.REDIS_ENABLED:
+        from app.cache import get_redis_cache
+        cache = get_redis_cache()
+        if cache.is_available:
+            cached = await cache.get(query, category=category, gender=gender, k=k)
+            if cached is not None:
+                return cached
+
+    # 2. 执行检索
+    if settings.RETRIEVAL_MODE == "hybrid":
+        from app.retrieval import hybrid_search
+        results = await hybrid_search(query, k=k, category=category, gender=gender)
+    else:
+        # 默认 dense 模式（向后兼容）
+        results = _dense_search(query, k=k, category=category, gender=gender)
+
+    # 3. 写缓存（fire-and-forget，不阻塞返回）
+    if settings.REDIS_ENABLED and results:
+        from app.cache import get_redis_cache
+        cache = get_redis_cache()
+        if cache.is_available:
+            asyncio.create_task(
+                cache.set(query, results, category=category, gender=gender, k=k)
+            )
+
+    return results
+
+
+def rebuild_bm25_index():
+    """从 SQLite 重建 BM25 稀疏索引。在知识库变更后调用。"""
+    from app.database import get_all_documents
+    from app.retrieval import get_bm25_retriever
+
+    docs = get_all_documents()
+    if docs:
+        bm25 = get_bm25_retriever()
+        doc_dicts = [
+            {
+                "doc_id": d["id"],
+                "title": d["title"],
+                "content": d["content"],
+                "category": d.get("category", "通用"),
+                "gender": d.get("gender", "通用"),
+            }
+            for d in docs
+        ]
+        bm25.build_index(doc_dicts)
+    else:
+        rag_log.info("知识库为空，跳过 BM25 索引构建")
 
 
 # ==================== 知识库初始化 ====================

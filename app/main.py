@@ -66,7 +66,70 @@ async def startup():
                 app_log.info("自动重建完成: %d 条文档已重新索引", reindexed)
     except Exception as e:
         app_log.warning("向量索引检查/重建出错（不影响正常使用）: %s", e)
-    app_log.info("服装电商智能客服 v0.2.1 启动")
+
+    # 初始化 Redis 缓存（优雅降级，失败了不阻止启动）
+    try:
+        from app.cache import init_cache
+        cache_ok = await init_cache()
+        if cache_ok:
+            app_log.info("Redis 缓存已连接")
+        else:
+            app_log.info("Redis 缓存未启用或不可用")
+    except Exception as e:
+        app_log.warning("Redis 初始化失败（不影响正常使用）: %s", e)
+
+    # 预构建 BM25 索引（仅 hybrid 模式需要）
+    if settings.RETRIEVAL_MODE != "dense":
+        try:
+            from app.rag import rebuild_bm25_index
+            rebuild_bm25_index()
+        except Exception as e:
+            app_log.warning("BM25 索引构建失败: %s", e)
+
+    app_log.info(
+        "服装电商智能客服 v0.3.3 启动 (retrieval=%s cb=%s redis=%s)",
+        settings.RETRIEVAL_MODE,
+        "on" if settings.CB_ENABLED else "off",
+        "on" if settings.REDIS_ENABLED else "off",
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """关闭连接池"""
+    try:
+        from app.cache import close_cache
+        await close_cache()
+    except Exception:
+        pass
+    app_log.info("服装电商智能客服 关闭")
+
+
+# ==================== 缓存与索引失效辅助 ====================
+
+async def _invalidate_caches_and_reindex():
+    """知识库文档变更后：失效 Redis 缓存 + 重建 BM25 索引。
+
+    在每次 KB 文档增/删/改后调用。所有操作封装 try/except，
+    因为缓存和索引是锦上添花，不能阻塞主流程。
+    """
+    # 1. 失效 Redis 语义缓存
+    try:
+        from app.cache import get_redis_cache
+        cache = get_redis_cache()
+        if cache.is_available:
+            await cache.invalidate()
+    except Exception as e:
+        app_log.warning("Redis 缓存失效异常: %s", e)
+
+    # 2. 重建 BM25 索引（仅在 hybrid 模式下需要）
+    try:
+        from config.settings import settings
+        if settings.RETRIEVAL_MODE != "dense":
+            from app.rag import rebuild_bm25_index
+            rebuild_bm25_index()
+    except Exception as e:
+        app_log.warning("BM25 索引重建异常: %s", e)
 
 
 # ==================== 认证路由 ====================
@@ -211,6 +274,7 @@ async def admin_create_document(
 
     doc_id = create_document(req.title, req.content, req.category, req.gender)
     rag_add(doc_id, req.title, req.content, req.category, req.gender)
+    await _invalidate_caches_and_reindex()
     app_log.info("管理员添加文档: id=%d title=%s gender=%s", doc_id, req.title, req.gender)
     return {"id": doc_id, "message": "文档添加成功"}
 
@@ -232,6 +296,8 @@ async def admin_batch_delete_documents(
             deleted += 1
         else:
             failed.append(doc_id)
+    if deleted > 0:
+        await _invalidate_caches_and_reindex()
     app_log.info("管理员批量删除文档: %d成功 %d失败", deleted, len(failed))
     return {"message": f"成功删除 {deleted} 条文档", "deleted": deleted, "failed": failed}
 
@@ -254,6 +320,7 @@ async def admin_update_document(
     # 获取更新后的文档用于重新嵌入
     updated = get_document_by_id(doc_id)
     rag_update(doc_id, updated["title"], updated["content"], updated["category"], updated.get("gender", "通用"))
+    await _invalidate_caches_and_reindex()
     app_log.info("管理员更新文档: id=%d", doc_id)
     return {"message": "文档更新成功"}
 
@@ -270,6 +337,7 @@ async def admin_delete_document(
     if not delete_document(doc_id):
         raise HTTPException(status_code=404, detail="文档不存在")
     rag_delete(doc_id)
+    await _invalidate_caches_and_reindex()
     app_log.info("管理员删除文档: id=%d", doc_id)
     return {"message": "文档删除成功"}
 
@@ -279,6 +347,8 @@ async def admin_init_kb(user: dict = Depends(require_admin)):
     """管理员：初始化知识库种子数据（幂等）"""
     from app.rag import seed_knowledge_base
     count = seed_knowledge_base()
+    if count > 0:
+        await _invalidate_caches_and_reindex()
     return {"message": "知识库初始化完成" if count else "知识库已有数据，跳过初始化", "count": count}
 
 

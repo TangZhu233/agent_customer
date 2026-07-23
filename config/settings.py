@@ -60,6 +60,38 @@ class Settings:
     # 默认 80000 字符（中文字符 ÷2 ≈ token，约 40000 token，占 128K 窗口 30%，留足余量）
     MAX_HISTORY_CHAR_LIMIT: int = int(os.getenv("MAX_HISTORY_CHAR_LIMIT", "80000"))
 
+    # --- 熔断器 (Circuit Breaker) ---
+    # 是否启用熔断保护
+    CB_ENABLED: bool = os.getenv("CB_ENABLED", "true").lower() == "true"
+    # 连续失败次数阈值（触发熔断 CLOSED → OPEN）
+    CB_FAILURE_THRESHOLD: int = int(os.getenv("CB_FAILURE_THRESHOLD", "5"))
+    # 熔断后等待多少秒进入 HALF_OPEN 状态
+    CB_RECOVERY_TIMEOUT: float = float(os.getenv("CB_RECOVERY_TIMEOUT", "30"))
+    # HALF_OPEN 状态下允许的最大探测请求数
+    CB_HALF_OPEN_MAX: int = int(os.getenv("CB_HALF_OPEN_MAX", "1"))
+    # 单次 LLM 调用的超时时间（秒），应大于 tenacity 总重试时间（约 14s = 2+4+8）
+    LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "30.0"))
+
+    # --- Redis 语义缓存 ---
+    # 是否启用 Redis 连接
+    REDIS_ENABLED: bool = os.getenv("REDIS_ENABLED", "false").lower() == "true"
+    # Redis 连接地址
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    # 缓存有效期（秒）
+    REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", "3600"))
+
+    # --- 多路召回检索 ---
+    # 检索模式：dense=仅向量(默认,向后兼容) | hybrid=向量+BM25融合
+    RETRIEVAL_MODE: str = os.getenv("RETRIEVAL_MODE", "dense")
+    # 是否启用 LLM 重排序
+    RERANK_ENABLED: bool = os.getenv("RERANK_ENABLED", "false").lower() == "true"
+    # RRF 融合常数 k（越大排名差异惩罚越小，学界标准 k=60）
+    FUSION_K: int = int(os.getenv("FUSION_K", "60"))
+    # 重排序候选文档数
+    RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "5"))
+    # 每条检索路径的召回数量（融合前拉取更多候选，融合后收敛至 VECTOR_SEARCH_K）
+    MULTI_RECALL_K: int = int(os.getenv("MULTI_RECALL_K", "10"))
+
 
 # 全局单例，其他模块直接 from config.settings import settings 使用
 settings = Settings()
